@@ -11,18 +11,85 @@ function Log([string]$m) {
   $fi = Get-Item $global:BWLog -ErrorAction SilentlyContinue
   if ($fi -and $fi.Length -gt 256KB) { Set-Content -Path $global:BWLog -Value (Get-Content $global:BWLog -Tail 200 -Encoding UTF8) -Encoding UTF8 }
 }
+# ---- 保存位置: 不再写死 D 盘 ----
+# 分享给朋友的机器可能只有 C 盘, 盘符也可能乱七八糟。定位置的规则:
+#   1) 本地固定磁盘里挑可用空间最大的"非系统盘"
+#   2) 只有 C 盘就用 C 盘
+#   3) 连固定磁盘都读不到(极罕见)才退到 用户的"图片"文件夹
+# 首次运行定一次并写进 config.json, 之后一直用那个位置, 不会自己漂。
+# 结果在单次运行里缓存 —— Get-BwConfig 被调用得很频繁, 不能每次都去枚举磁盘。
+function Get-BwPickRoot {
+  if ($global:BWPickRoot) { return $global:BWPickRoot }
+  $sys = ''
+  try { $sys = ([string]$env:SystemDrive).TrimEnd('\') } catch {}
+  $fixed = @(); $net = @()
+  try {
+    foreach ($dr in [System.IO.DriveInfo]::GetDrives()) {
+      try {
+        if (-not $dr.IsReady) { continue }
+        $n = ([string]$dr.Name).TrimEnd('\')
+        if ((-not $n) -or ($n -eq 'A:') -or ($n -eq 'B:')) { continue }
+        $item = [psobject]@{ Name = $n; Free = [long]$dr.AvailableFreeSpace; Sys = ($n -eq $sys) }
+        if ($dr.DriveType -eq [System.IO.DriveType]::Fixed) { $fixed += $item }
+        elseif ($dr.DriveType -eq [System.IO.DriveType]::Network) { $net += $item }
+      } catch {}
+    }
+  } catch {}
+  $pick = @($fixed | Where-Object { -not $_.Sys } | Sort-Object Free -Descending)
+  if ($pick.Count -eq 0) { $pick = @($fixed | Sort-Object Free -Descending) }
+  if ($pick.Count -eq 0) { $pick = @($net | Sort-Object Free -Descending) }
+  if ($pick.Count -gt 0) { $global:BWPickRoot = ($pick[0].Name + '\') }
+  else { $global:BWPickRoot = (Join-Path $env:USERPROFILE 'Pictures') }
+  return $global:BWPickRoot
+}
+function Get-BwDefaults {
+  if ($global:BWDefaults) { return $global:BWDefaults }
+  $base = Join-Path (Get-BwPickRoot) '微软壁纸助手'
+  $global:BWDefaults = [psobject]@{
+    base      = $base
+    bing      = (Join-Path $base '必应')
+    spotlight = (Join-Path $base '聚焦')
+  }
+  return $global:BWDefaults
+}
+# 目录不存在就建。建不成(权限/盘被拔了)返回 $false, 让调用方说人话, 而不是抛一堆栈。
+function Ensure-BwDirs {
+  $c = Get-BwConfig
+  foreach ($d in @($c.bing_save_dir, $c.spotlight_save_dir)) {
+    if (-not $d) { continue }
+    if (-not (Test-Path -LiteralPath $d)) {
+      try { New-Item -LiteralPath $d -ItemType Directory -Force -ErrorAction Stop | Out-Null } catch {}
+    }
+  }
+  return [bool](Test-Path -LiteralPath $c.bing_save_dir)
+}
+# 真写一个临时文件再删, 比只看目录能不能访问准
+function Test-BwWritable([string]$dir) {
+  if (-not $dir) { return $false }
+  try {
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -LiteralPath $dir -ItemType Directory -Force -ErrorAction Stop | Out-Null }
+    $t = Join-Path $dir ('.wtest_' + [guid]::NewGuid().ToString('N'))
+    Set-Content -LiteralPath $t -Value 'x' -Encoding ASCII -ErrorAction Stop
+    Remove-Item -LiteralPath $t -Force -ErrorAction SilentlyContinue
+    return $true
+  } catch { return $false }
+}
 function Get-BwConfig {
   $c = $null
   if (Test-Path $global:CfgPath) { try { $c = Get-Content $global:CfgPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch {} }
+  $d = Get-BwDefaults
   if (-not $c) {
     $c = New-Object PSObject
-    Add-Member -InputObject $c NoteProperty bing_save_dir 'D:\Bing壁纸' -Force
-    Add-Member -InputObject $c NoteProperty spotlight_save_dir 'D:\聚焦壁纸' -Force
+    Add-Member -InputObject $c NoteProperty bing_save_dir $d.bing -Force
+    Add-Member -InputObject $c NoteProperty spotlight_save_dir $d.spotlight -Force
     Add-Member -InputObject $c NoteProperty resolution_mode 'uhd' -Force
   }
+  if (-not $c.bing_save_dir) { Add-Member -InputObject $c NoteProperty bing_save_dir $d.bing -Force }
   if (-not $c.spotlight_save_dir) {
-    $q = if ($c.bing_save_dir) { Split-Path $c.bing_save_dir -Qualifier } else { 'D:' }
-    Add-Member -InputObject $c NoteProperty spotlight_save_dir "$q\聚焦壁纸" -Force
+    # 默认放必应库旁边; 必应库要是在盘根, 就退回 "<盘>\聚焦"
+    $par = Split-Path $c.bing_save_dir -Parent
+    if ($par) { Add-Member -InputObject $c NoteProperty spotlight_save_dir (Join-Path $par '聚焦') -Force }
+    else { Add-Member -InputObject $c NoteProperty spotlight_save_dir $d.spotlight -Force }
   }
   if (-not $c.resolution_mode) { Add-Member -InputObject $c NoteProperty resolution_mode 'uhd' -Force }
   if (-not $c.spotlight_per_cycle) { Add-Member -InputObject $c NoteProperty spotlight_per_cycle 6 -Force }
@@ -433,6 +500,7 @@ function Invoke-BwUpdate {
 function Invoke-BwCycle {
   try {
     $c = Get-BwConfig
+    $null = Ensure-BwDirs
     $s = Get-BwState
     $now = Get-Date
     $today = $now.ToString('yyyy-MM-dd')

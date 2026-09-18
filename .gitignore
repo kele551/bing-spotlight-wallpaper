@@ -2,6 +2,18 @@
 config.json
 state.json
 wallpaper.log
+微软壁纸助手数据/
+launcher.txt
+daemon.stop
+.version
+.files.json
+
+# 打包产物
+微软壁纸助手.exe
+*.spec
+build/
+dist/
+__pycache__/
 
 # 备份
 *.bak
