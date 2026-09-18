@@ -18,6 +18,28 @@ function Log([string]$m) {
 #   3) 连固定磁盘都读不到(极罕见)才退到 用户的"图片"文件夹
 # 首次运行定一次并写进 config.json, 之后一直用那个位置, 不会自己漂。
 # 结果在单次运行里缓存 —— Get-BwConfig 被调用得很频繁, 不能每次都去枚举磁盘。
+#
+# 盘根**能不能建文件夹**是独立的一件事, 必须单独探。Windows 不保证数据盘根目录可写:
+# 本机 D:\ 根只有 BUILTIN\Users 的"读取和执行", 没有修改权限, 普通用户在那里
+# New-Item 会直接失败 —— 空间再大也白搭。所以"可写"是挑盘的硬条件。
+# 实测 (本机, 非提权): D:\ 建不了; E:\ F:\ 建得了。
+function Test-BwRootWritable([string]$root) {
+  if (-not $root) { return $false }
+  if (-not $global:BWWriteCache) { $global:BWWriteCache = @{} }
+  $k = $root.ToUpper()
+  if ($global:BWWriteCache.ContainsKey($k)) { return $global:BWWriteCache[$k] }
+  $ok = $false
+  $probe = Join-Path $root ('.wbwtest_' + [guid]::NewGuid().ToString('N'))
+  # 用 .NET 建/删, 不走 New-Item —— 有的运行环境把 cmdlet 的参数集裁过, 传 -LiteralPath
+  # 会直接报"找不到与参数名称匹配的参数"。那是环境问题, 不是权限问题, 会造成假阴性误判。
+  try {
+    [void][System.IO.Directory]::CreateDirectory($probe)
+    $ok = $true
+  } catch { $ok = $false }
+  if ($ok) { try { [System.IO.Directory]::Delete($probe, $true) } catch {} }
+  $global:BWWriteCache[$k] = $ok
+  return $ok
+}
 function Get-BwPickRoot {
   if ($global:BWPickRoot) { return $global:BWPickRoot }
   $sys = ''
@@ -32,14 +54,22 @@ function Get-BwPickRoot {
         # 必须是 [PSCustomObject]。写成 [psobject]@{} 或 @{} 得到的是 Hashtable,
         # Sort-Object 取不到 .Free 属性 -> 排序**静默失效**, 结果按枚举顺序倒着来,
         # 实测恒返回 F: (哪怕 E: 的可用空间是它的两倍)。
-        $item = [PSCustomObject]@{ Name = $n; Free = [long]$dr.AvailableFreeSpace; Sys = ($n -eq $sys) }
+        $item = [PSCustomObject]@{
+          Name     = $n
+          Free     = [long]$dr.AvailableFreeSpace
+          Sys      = ($n -eq $sys)
+          Writable = (Test-BwRootWritable ($n + '\'))
+        }
         if ($dr.DriveType -eq [System.IO.DriveType]::Fixed) { $fixed += $item }
         elseif ($dr.DriveType -eq [System.IO.DriveType]::Network) { $net += $item }
       } catch {}
     }
   } catch {}
-  $pick = @($fixed | Where-Object { -not $_.Sys } | Sort-Object Free -Descending)
+  # 优先级: 非系统盘且可写 > 非系统盘 > 任意本地盘 > 可写网络盘 > 任意网络盘
+  $pick = @($fixed | Where-Object { -not $_.Sys -and $_.Writable } | Sort-Object Free -Descending)
+  if ($pick.Count -eq 0) { $pick = @($fixed | Where-Object { -not $_.Sys } | Sort-Object Free -Descending) }
   if ($pick.Count -eq 0) { $pick = @($fixed | Sort-Object Free -Descending) }
+  if ($pick.Count -eq 0) { $pick = @($net | Where-Object { $_.Writable } | Sort-Object Free -Descending) }
   if ($pick.Count -eq 0) { $pick = @($net | Sort-Object Free -Descending) }
   if ($pick.Count -gt 0) { $global:BWPickRoot = ($pick[0].Name + '\') }
   else { $global:BWPickRoot = (Join-Path $env:USERPROFILE 'Pictures') }
@@ -59,14 +89,22 @@ function Get-BwDriveChoices {
         if ((-not $n) -or ($n -eq 'A:') -or ($n -eq 'B:')) { continue }
         $net = ($dr.DriveType -eq [System.IO.DriveType]::Network)
         if ((-not $net) -and ($dr.DriveType -ne [System.IO.DriveType]::Fixed)) { continue }
-        $list += [PSCustomObject]@{ Name = $n; Free = [long]$dr.AvailableFreeSpace; Sys = ($n -eq $sys); Net = $net }
+        $list += [PSCustomObject]@{
+          Name     = $n
+          Free     = [long]$dr.AvailableFreeSpace
+          Sys      = ($n -eq $sys)
+          Net      = $net
+          Writable = (Test-BwRootWritable ($n + '\'))
+        }
       } catch {}
     }
   } catch {}
   if ($list.Count -eq 0) { return @() }
-  $nonSys = @($list | Where-Object { -not $_.Sys } | Sort-Object Free -Descending)
-  $sysLst = @($list | Where-Object { $_.Sys } | Sort-Object Free -Descending)
-  return @($nonSys + $sysLst)
+  # 能写的排前面, 其次非系统盘, 同档按可用空间从大到小。
+  # 这样用户看到的第一个就是真正能用的, 不用自己踩坑。
+  return @($list | Sort-Object @{ Expression = { if ($_.Writable) { 0 } else { 1 } } },
+                                  @{ Expression = { if ($_.Sys) { 1 } else { 0 } } },
+                                  @{ Expression = { $_.Free }; Descending = $true })
 }
 function Get-BwDefaults {
   if ($global:BWDefaults) { return $global:BWDefaults }

@@ -1,7 +1,7 @@
 ﻿# 微软壁纸助手 - 单层菜单 (by 海风 & 小腾)
 . (Join-Path $PSScriptRoot 'core.ps1')
 
-$global:BWVersion = '1.2.1'
+$global:BWVersion = '1.2.2'
 
 # 把用户按键归一化: 去首尾空格 + 全角转半角 + 转小写。
 # 中文输入法很容易把 o 打成全角 ｏ, 不归一化就变成"按了键没反应"。
@@ -173,11 +173,13 @@ function Invoke-BwFirstRun {
   Write-Host '  图片全部存在你自己电脑上, 不往任何服务器上传东西。'
   Write-Host ''
   $choices = @(Get-BwDriveChoices)
-  if ($choices.Count -gt 0) {
-    Write-Host '  C 盘以外的盘都可以放, 按可用空间从大到小:'
+  $usable = @($choices | Where-Object { $_.Writable })
+  $blocked = @($choices | Where-Object { -not $_.Writable })
+  if ($usable.Count -gt 0) {
+    Write-Host '  可以放壁纸的盘 (非系统盘优先, 按可用空间从大到小):'
     Write-Host ''
     $ci = 0
-    foreach ($ch in $choices) {
+    foreach ($ch in $usable) {
       $mark = ''
       if ($ch.Sys) { $mark = '  (系统盘, 不推荐)' }
       elseif ($ci -eq 0) { $mark = '  <-- 推荐' }
@@ -186,13 +188,20 @@ function Invoke-BwFirstRun {
     }
     Write-Host ''
   }
+  if ($blocked.Count -gt 0) {
+    foreach ($ch in $blocked) {
+      Write-Host ('   ' + $ch.Name + '\ 用不了: 这个盘的根目录没给普通用户"新建文件夹"的权限 (它还有 ' + [math]::Round($ch.Free / 1GB, 1) + ' GB 空闲)') -ForegroundColor DarkGray
+    }
+    Write-Host '   (要让该盘能用, 得由管理员给它根目录加"修改"权限)' -ForegroundColor DarkGray
+    Write-Host ''
+  }
   Write-Host ('  建议保存到: ' + $d.base) -ForegroundColor Green
   $in = Read-Host '  回车 = 接受推荐位置, 也可直接输入上面的序号或一个完整路径'
   $base = $d.base
   if ($in) {
     $t = $in.Trim().Trim('"')
-    if (($t -match '^\d+$') -and ([int]$t -ge 1) -and ([int]$t -le $choices.Count)) {
-      $base = Join-Path (($choices[[int]$t - 1].Name) + '\') '微软壁纸助手'
+    if (($t -match '^\d+$') -and ([int]$t -ge 1) -and ([int]$t -le $usable.Count)) {
+      $base = Join-Path (($usable[[int]$t - 1].Name) + '\') '微软壁纸助手'
     } else {
       $base = $t
     }
@@ -208,6 +217,7 @@ function Invoke-BwFirstRun {
   if (-not (Test-BwWritable $bing) -or -not (Test-BwWritable $spot)) {
     Write-Host ''
     Write-Host ('  这个位置写不进去, 改用默认位置: ' + $d.base) -ForegroundColor Yellow
+    Write-Host '  常见原因: 该盘根目录没给普通用户"新建文件夹"的权限; 也可能目录只读或盘不在。' -ForegroundColor DarkGray
     $base = $d.base
     $bing = Join-Path $base '必应'
     $spot = Join-Path $base '聚焦'
