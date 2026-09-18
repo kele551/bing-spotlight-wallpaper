@@ -1,0 +1,7 @@
+{
+    "bing_save_dir": "D:\\Bing壁纸",
+    "spotlight_save_dir": "D:\\聚焦壁纸",
+    "resolution_mode": "uhd",
+    "cycle_minutes": 30,
+    "spotlight_per_cycle": 6
+}

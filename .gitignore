@@ -1,0 +1,7 @@
+# 运行时文件, 不进版本库
+config.json
+state.json
+wallpaper.log
+
+# 备份
+*.bak
