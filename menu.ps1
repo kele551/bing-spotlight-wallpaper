@@ -1,7 +1,7 @@
 ﻿# 微软壁纸助手 - 单层菜单 (by 海风 & 小腾)
 . (Join-Path $PSScriptRoot 'core.ps1')
 
-$global:BWVersion = '1.2.2'
+$global:BWVersion = '1.2.3'
 
 # 把用户按键归一化: 去首尾空格 + 全角转半角 + 转小写。
 # 中文输入法很容易把 o 打成全角 ｏ, 不归一化就变成"按了键没反应"。
@@ -139,17 +139,15 @@ function Edit-BwSettings {
   $b = Read-Host '  必应库位置 (回车不变, 输入 o 打开文件夹)'
   if ((Normalize-BwKey $b) -eq 'o') { Open-BwDir $c.bing_save_dir }
   elseif ($b) {
-    if (-not (Test-BwPathShape $b)) { Write-Host '  要写完整路径, 比如 D:\壁纸\必应 —— 已保持不变' }
-    elseif (Test-BwWritable $b) { $c.bing_save_dir = $b; Write-Host ('  已设为 ' + $b) }
-    else { Write-Host '  这个位置写不进去 (权限或盘不存在), 已保持不变' }
+    $nb = Set-BwLibDir $b '必应'
+    if ($nb) { $c.bing_save_dir = $nb; Write-Host ('  已设为 ' + $nb) }
   }
 
   $d = Read-Host '  聚焦库位置 (回车不变, 输入 o 打开文件夹)'
   if ((Normalize-BwKey $d) -eq 'o') { Open-BwDir $c.spotlight_save_dir }
   elseif ($d) {
-    if (-not (Test-BwPathShape $d)) { Write-Host '  要写完整路径, 比如 D:\壁纸\聚焦 —— 已保持不变' }
-    elseif (Test-BwWritable $d) { $c.spotlight_save_dir = $d; Write-Host ('  已设为 ' + $d) }
-    else { Write-Host '  这个位置写不进去 (权限或盘不存在), 已保持不变' }
+    $nd = Set-BwLibDir $d '聚焦'
+    if ($nd) { $c.spotlight_save_dir = $nd; Write-Host ('  已设为 ' + $nd) }
   }
 
   Save-BwConfig $c
@@ -160,69 +158,149 @@ function Edit-BwSettings {
 }
 
 # ---------- 首次运行向导 ----------
+# 这个向导只**排序**, 不**筛选**。
+#
+# "某个盘现在能不能写"是每台机器各自的权限设置, 不是本程序的产品规则 ——
+# 所以每一个盘都要出现在列表里、每一个都能被选中。默认值只是"排在最前面的那个",
+# 它不剥夺任何人选别的盘的权利。
+# (v1.2.2 把写不进去的盘从编号列表里剔了出去, 那等于用我这一台机器的权限去替
+#  所有 GitHub 用户做决定: 用户看到自己的盘不在列表里, 会以为程序不支持那个盘,
+#  而实际只是那台机器上少了一条 ACL。v1.2.3 改回全列出, 不能写的当场给一键修复。)
+
+# 排列方式: 非系统盘在前 (能用的在前, 同档按可用空间从大到小), 系统盘固定放最后。
+function Get-BwOrderedDrives {
+  $all  = @(Get-BwDriveChoices)
+  $data = @($all | Where-Object { -not $_.Sys })
+  $sys  = @($all | Where-Object { $_.Sys })
+  return @($data + $sys)
+}
+
+# 一行一个盘。不能写的盘不打叉也不隐藏, 只加一句说明 —— 用户看得见才谈得上选。
+function Format-BwDriveLine([int]$idx, $ch, [string]$recRoot) {
+  $tags = @()
+  if (-not $ch.Writable) { $tags += '这台机器上还没给写入权限, 选中可一键修' }
+  if ($ch.Sys) { $tags += '系统盘, 不推荐' }
+  $tail = ''
+  if ($tags.Count -gt 0) { $tail = '   (' + ($tags -join '; ') + ')' }
+  $mark = ''
+  if (($tags.Count -eq 0) -and $recRoot -and ($ch.Name -eq $recRoot)) { $mark = '   <-- 建议' }
+  return ('   [{0}] {1}\微软壁纸助手   可用 {2} GB{3}{4}' -f $idx, $ch.Name, [math]::Round($ch.Free / 1GB, 1), $tail, $mark)
+}
+
+# 用户挑了一个这台机器上写不进去的位置 -> 解释清楚 + 给两条路,
+# 绝不静默退回默认位置 (那正是"用户以为程序不支持他的盘"的来源)。
+# 返回修好之后的路径; 用户不修、或修不成, 返回空串。
+function Resolve-BwUnwritableBase([string]$base) {
+  $drive = ''
+  if ($base -match '^([A-Za-z]:)\\') { $drive = $Matches[1] + '\' }
+  Write-Host ''
+  Write-Host ('  ' + $base + ' 现在写不进去。') -ForegroundColor Yellow
+  if ($drive) {
+    Write-Host ('  最常见的原因: ' + $drive + ' 的根目录没给普通用户"新建文件夹"的权限。') -ForegroundColor DarkGray
+    Write-Host '  那是这台机器的权限设置, 不是本程序不支持这个盘 —— 盘上别的目录也可能照样能写。' -ForegroundColor DarkGray
+  } else {
+    Write-Host '  可能原因: 路径不存在、没有权限, 或者网络盘没连上。' -ForegroundColor DarkGray
+  }
+  Write-Host ''
+  Write-Host ('   [1] 现在就修好它 —— 用一次管理员权限建出 ' + $base) -ForegroundColor Gray
+  Write-Host '       并只给这一个文件夹授权 (不动盘根, 不动盘上别的目录;' -ForegroundColor DarkGray
+  Write-Host '       删掉这个文件夹就等于完全回退, 不留任何权限改动)' -ForegroundColor DarkGray
+  Write-Host '   [2] 我自己换一个位置'
+  Write-Host '   回车 = 返回'
+  $k = Normalize-BwKey (Read-Host '  怎么处理')
+  if ($k -eq '1') {
+    if (-not $drive) {
+      Write-Host '  非本地盘符的位置没法自动创建, 请先自己把文件夹建好。' -ForegroundColor Yellow
+      Pause-Bw
+      return ''
+    }
+    Write-Host '  正在修复, 会弹一次管理员授权框...' -ForegroundColor DarkGray
+    if (Repair-BwBaseDir $base) {
+      Write-Host ('  修好了: ' + $base) -ForegroundColor Green
+      Pause-Bw
+      return $base
+    }
+    Write-Host '  没修成 —— 可能是授权被取消了, 或者这个位置不允许自动创建。' -ForegroundColor Yellow
+    Pause-Bw
+    return ''
+  }
+  return ''
+}
+
+# [8] 设置里改库位置用: 能写就直接用; 不能写给和向导一样的一键修复, 而不是只回一句
+# "写不进去"就完事。返回最终可用的位置, 或者空串表示保持不变。
+function Set-BwLibDir([string]$want, [string]$what) {
+  if (-not (Test-BwPathShape $want)) {
+    Write-Host ('  要写完整路径, 比如 D:\壁纸\' + $what + ' —— 已保持不变')
+    return ''
+  }
+  if (Test-BwWritable $want) { return $want }
+  $fix = Resolve-BwUnwritableBase $want
+  if ($fix -and (Test-BwWritable $fix)) { return $fix }
+  Write-Host '  已保持不变。'
+  return ''
+}
+
 function Invoke-BwFirstRun {
   $d = Get-BwDefaults
-  Clear-Host
-  Write-Host '========== 微软壁纸助手 · 首次运行 ==========' -ForegroundColor Cyan
-  Write-Host ''
-  Write-Host '  它会做三件事:'
-  Write-Host '    1. 每天把「必应每日一图」存到本机并设为壁纸'
-  Write-Host '    2. 每半小时换一张「Windows 聚焦」壁纸 (不重复)'
-  Write-Host '    3. 几天没开机也不漏图, 错过的必应壁纸会自动补齐'
-  Write-Host ''
-  Write-Host '  图片全部存在你自己电脑上, 不往任何服务器上传东西。'
-  Write-Host ''
-  $choices = @(Get-BwDriveChoices)
-  $usable = @($choices | Where-Object { $_.Writable })
-  $blocked = @($choices | Where-Object { -not $_.Writable })
-  if ($usable.Count -gt 0) {
-    Write-Host '  可以放壁纸的盘 (非系统盘优先, 按可用空间从大到小):'
+  $base = ''
+  while (-not $base) {
+    Clear-Host
+    Write-Host '========== 微软壁纸助手 · 首次运行 ==========' -ForegroundColor Cyan
     Write-Host ''
-    $ci = 0
-    foreach ($ch in $usable) {
-      $mark = ''
-      if ($ch.Sys) { $mark = '  (系统盘, 不推荐)' }
-      elseif ($ci -eq 0) { $mark = '  <-- 推荐' }
-      Write-Host ('   [{0}] {1}\微软壁纸助手   可用 {2} GB{3}' -f ($ci + 1), $ch.Name, [math]::Round($ch.Free / 1GB, 1), $mark)
-      $ci++
-    }
+    Write-Host '  它会做三件事:'
+    Write-Host '    1. 每天把「必应每日一图」存到本机并设为壁纸'
+    Write-Host '    2. 每半小时换一张「Windows 聚焦」壁纸 (不重复)'
+    Write-Host '    3. 几天没开机也不漏图, 错过的必应壁纸会自动补齐'
     Write-Host ''
-  }
-  if ($blocked.Count -gt 0) {
-    foreach ($ch in $blocked) {
-      Write-Host ('   ' + $ch.Name + '\ 用不了: 这个盘的根目录没给普通用户"新建文件夹"的权限 (它还有 ' + [math]::Round($ch.Free / 1GB, 1) + ' GB 空闲)') -ForegroundColor DarkGray
-    }
-    Write-Host '   (要让该盘能用, 得由管理员给它根目录加"修改"权限)' -ForegroundColor DarkGray
+    Write-Host '  图片全部存在你自己电脑上, 不往任何服务器上传东西。'
     Write-Host ''
-  }
-  Write-Host ('  建议保存到: ' + $d.base) -ForegroundColor Green
-  $in = Read-Host '  回车 = 接受推荐位置, 也可直接输入上面的序号或一个完整路径'
-  $base = $d.base
-  if ($in) {
-    $t = $in.Trim().Trim('"')
-    if (($t -match '^\d+$') -and ([int]$t -ge 1) -and ([int]$t -le $usable.Count)) {
-      $base = Join-Path (($usable[[int]$t - 1].Name) + '\') '微软壁纸助手'
+    Write-Host '  壁纸存到哪个盘? 这台机器上的盘下面全都在, 挑一个就行:'
+    Write-Host ''
+    $list = @(Get-BwOrderedDrives)
+    $recRoot = ''
+    try { $recRoot = (Get-BwPickRoot).TrimEnd('\') } catch {}
+    $i = 0
+    foreach ($ch in $list) { $i++; Write-Host (Format-BwDriveLine $i $ch $recRoot) }
+    if ($list.Count -eq 0) { Write-Host '   (一个盘都没读到, 直接输入完整路径吧)' }
+    Write-Host ''
+    Write-Host ('   建议: ' + $d.base) -ForegroundColor Green
+    Write-Host '   回车 = 用建议位置 · 也可以输入上面的序号 · 或直接粘贴完整路径'
+    Write-Host '   (想放在某个盘自己的子目录里, 就直接输入那条完整路径, 比如 D:\壁纸)'
+    Write-Host ''
+    $in = Read-Host '  壁纸存哪'
+    $t = ''
+    if ($in) { $t = $in.Trim().Trim('"') }
+
+    if ($t -match '^\d+$') {
+      $idx = [int]$t
+      if (($idx -lt 1) -or ($idx -gt $list.Count)) {
+        Write-Host ('  列表里没有 [' + $idx + '] 这一项 (共 ' + $list.Count + ' 个), 请重新选。') -ForegroundColor Yellow
+        Pause-Bw
+        continue
+      }
+      $base = Join-Path ($list[$idx - 1].Name + '\') '微软壁纸助手'
+    } elseif ($t) {
+      if (-not (Test-BwPathShape $t)) {
+        Write-Host ''
+        Write-Host ('  「' + $t + '」不是完整路径。要写成像 D:\壁纸 这样, 网络盘写 \\服务器\共享\目录。') -ForegroundColor Yellow
+        Pause-Bw
+        continue
+      }
+      $base = $t.TrimEnd('\')
     } else {
-      $base = $t
+      $base = $d.base
     }
+
+    # 位置定了, 但"能写"才是真定了。不能写就地解释 + 给一键修复。
+    if ((Test-BwWritable (Join-Path $base '必应')) -and (Test-BwWritable (Join-Path $base '聚焦'))) { break }
+    $fixed = Resolve-BwUnwritableBase $base
+    if ($fixed) { $base = $fixed; break }
+    $base = ''    # 没修成 -> 回到列表重来, 而不是偷偷换到别的地方
   }
 
-  if (-not (Test-BwPathShape $base)) {
-    Write-Host ''
-    Write-Host ('  这不是个完整的盘符路径, 改用默认位置: ' + $d.base) -ForegroundColor Yellow
-    $base = $d.base
-  }
   $bing = Join-Path $base '必应'
   $spot = Join-Path $base '聚焦'
-  if (-not (Test-BwWritable $bing) -or -not (Test-BwWritable $spot)) {
-    Write-Host ''
-    Write-Host ('  这个位置写不进去, 改用默认位置: ' + $d.base) -ForegroundColor Yellow
-    Write-Host '  常见原因: 该盘根目录没给普通用户"新建文件夹"的权限; 也可能目录只读或盘不在。' -ForegroundColor DarkGray
-    $base = $d.base
-    $bing = Join-Path $base '必应'
-    $spot = Join-Path $base '聚焦'
-    $null = Test-BwWritable $bing
-  }
 
   $c = Get-BwConfig
   $c.bing_save_dir = $bing

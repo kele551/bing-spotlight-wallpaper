@@ -19,10 +19,22 @@ function Log([string]$m) {
 # 首次运行定一次并写进 config.json, 之后一直用那个位置, 不会自己漂。
 # 结果在单次运行里缓存 —— Get-BwConfig 被调用得很频繁, 不能每次都去枚举磁盘。
 #
-# 盘根**能不能建文件夹**是独立的一件事, 必须单独探。Windows 不保证数据盘根目录可写:
-# 本机 D:\ 根只有 BUILTIN\Users 的"读取和执行", 没有修改权限, 普通用户在那里
-# New-Item 会直接失败 —— 空间再大也白搭。所以"可写"是挑盘的硬条件。
-# 实测 (本机, 非提权): D:\ 建不了; E:\ F:\ 建得了。
+# 盘根**能不能建文件夹**是独立的一件事, 必须每台机器单独实测, 不能写死。
+# Windows 装机时会给数据盘根目录写上 `Authenticated Users:(M)`, 这样普通用户能建目录;
+# 但用第三方分区/格式化工具做出来的盘常常只有 `Users:(OI)(CI)(RX)`, 于是:
+#   - 这个盘的可用空间再大, 普通用户也建不出 <盘>\微软壁纸助手;
+#   - 盘上**别的**已有目录可能反而是可写的 (权限是按目录给的, 不是按盘给的)。
+# 所以"能不能用这个盘"必须现场探。探出来不能用的盘, 不是"坏盘", 是本机权限设置,
+# 用户随时可以用管理员权限补一次 —— 见 Repair-BwBaseDir。
+# 建目录统一走 .NET, 不用 New-Item: 本机 PowerShell 5.1 的 New-Item 参数表里
+# **没有 -LiteralPath** (实测 Get-Command New-Item 只列 Path/Name/ItemType/Value/Force...),
+# 传它会抛 ParameterBindingException。那是环境差异不是权限问题, 会让"能写的盘"
+# 被误判成"写不进去"。.NET API 没有这个坑。
+function New-BwDir([string]$dir) {
+  if (-not $dir) { return $false }
+  if (Test-Path -LiteralPath $dir) { return $true }
+  try { [void][System.IO.Directory]::CreateDirectory($dir); return $true } catch { return $false }
+}
 function Test-BwRootWritable([string]$root) {
   if (-not $root) { return $false }
   if (-not $global:BWWriteCache) { $global:BWWriteCache = @{} }
@@ -30,14 +42,79 @@ function Test-BwRootWritable([string]$root) {
   if ($global:BWWriteCache.ContainsKey($k)) { return $global:BWWriteCache[$k] }
   $ok = $false
   $probe = Join-Path $root ('.wbwtest_' + [guid]::NewGuid().ToString('N'))
-  # 用 .NET 建/删, 不走 New-Item —— 有的运行环境把 cmdlet 的参数集裁过, 传 -LiteralPath
-  # 会直接报"找不到与参数名称匹配的参数"。那是环境问题, 不是权限问题, 会造成假阴性误判。
   try {
     [void][System.IO.Directory]::CreateDirectory($probe)
     $ok = $true
   } catch { $ok = $false }
   if ($ok) { try { [System.IO.Directory]::Delete($probe, $true) } catch {} }
   $global:BWWriteCache[$k] = $ok
+  return $ok
+}
+# 「这个盘现在能不能拿来存壁纸」—— 这才是向导真正要回答的问题。
+# 判据不是"盘根可写吗", 而是"本程序能不能在这个盘上用自己那个文件夹":
+#   * 盘根可写                -> 能 (标准数据盘, 多数机器都是这样)
+#   * 盘根不可写但库目录可写  -> 也能 (之前用管理员权限建过一次并已授权; 不该再提示)
+#   * 两个都不行              -> 不能, 但可以一键修 (见 Repair-BwBaseDir)
+# 分开判很重要: 用户修过一次之后, 不该每次运行都被再问一遍"这个盘要不要修"。
+function Test-BwDriveUsable([string]$root) {
+  if (-not $root) { return $false }
+  $r = $root.TrimEnd('\') + '\'
+  if (Test-BwRootWritable $r) { return $true }
+  return (Test-BwWritable (Join-Path $r '微软壁纸助手'))
+}
+# 盘根写不进去时的一次性修复。
+#
+# 做法: 用管理员权限(弹一次 UAC) 建出 <盘>\微软壁纸助手\必应 和 \聚焦, 再把"修改"
+# 权限**只**给这一个文件夹 —— `Authenticated Users:(OI)(CI)(M)`, 与 Windows 装机时
+# 给数据盘根目录写的那条一模一样。
+#
+# 为什么必须提权: 建这个文件夹本身就要对盘根的写权限, 普通用户没有。
+# 为什么授权范围只到这一个文件夹: 不动盘根, 不动盘上任何别的目录 —— 把
+# <盘>\微软壁纸助手 删掉就等于完全回退, 不留任何权限改动。这也是它比
+# `icacls <盘>\ /grant "Authenticated Users:(M)"` 那种"改整个盘根"做法克制的地方。
+#
+# 只处理本地盘符; UNC 网络路径这里修不了, 让用户自己先建好文件夹。
+# 返回 $true 表示修完并且实测能写。
+function Repair-BwBaseDir([string]$base) {
+  if (-not $base) { return $false }
+  $b = $base.TrimEnd('\')
+  if ($b -notmatch '^[A-Za-z]:\\.') { return $false }   # 只认本地盘符 + 至少一层目录
+  $bing = Join-Path $b '必应'
+  $spot = Join-Path $b '聚焦'
+  # 单引号字符串字面量, 顺带把路径里可能出现的单引号转义掉
+  $lit = { param($s) "'" + ($s -replace "'", "''") + "'" }
+  # 顺序要紧: 先建 $b -> 给 $b 授权 -> 再建子目录。
+  # 反过来的话子目录会先继承盘根那条"只读"ACE, 之后还得靠 icacls /T 补救。
+  $lines = @(
+    '$ErrorActionPreference = ''Stop'''
+    ('try { [void][System.IO.Directory]::CreateDirectory(' + (& $lit $b) + ') } catch { exit 2 }')
+    ('$null = icacls ' + (& $lit $b) + ' /grant ' + (& $lit 'Authenticated Users:(OI)(CI)(M)'))
+    'if ($LASTEXITCODE -ne 0) { exit 3 }'
+    ('try { [void][System.IO.Directory]::CreateDirectory(' + (& $lit $bing) + ') } catch { exit 4 }')
+    ('try { [void][System.IO.Directory]::CreateDirectory(' + (& $lit $spot) + ') } catch { exit 4 }')
+    'exit 0'
+  )
+  # 提权那一侧的命令行转义太容易出错, 所以落成临时 .ps1 再 -File 执行。
+  # 必须带 UTF-8 BOM: 不带 BOM 时 PowerShell 5.1 按 ANSI 读, 中文路径会乱码。
+  $tmp = Join-Path $env:TEMP ('wbwfix_' + [guid]::NewGuid().ToString('N') + '.ps1')
+  try {
+    [System.IO.File]::WriteAllText($tmp, ($lines -join "`r`n"), (New-Object System.Text.UTF8Encoding($true)))
+  } catch { return $false }
+  $code = -1
+  try {
+    $p = Start-Process -FilePath 'powershell.exe' -Verb RunAs -Wait -PassThru -WindowStyle Hidden `
+         -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $tmp)
+    if ($p) { $code = $p.ExitCode }
+  } catch {
+    Log ('盘权限修复: 提权被取消或起不来 - ' + $_.Exception.Message)
+    $code = -1
+  }
+  try { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue } catch {}
+  if ($code -ne 0) { Log ('盘权限修复: 退出码 ' + $code + ' (2/3/4=建目录或授权失败, -1=提权被取消)'); return $false }
+  # 盘根那条 ACL 是进程外改的, 进程内缓存里的旧结论作废, 重新实测
+  if ($global:BWWriteCache) { $global:BWWriteCache.Remove(($b.Substring(0, 3)).ToUpper()) }
+  $ok = ((Test-BwWritable $bing) -and (Test-BwWritable $spot))
+  Log ('盘权限修复: ' + $b + ' -> 实测可写=' + $ok)
   return $ok
 }
 function Get-BwPickRoot {
@@ -58,7 +135,7 @@ function Get-BwPickRoot {
           Name     = $n
           Free     = [long]$dr.AvailableFreeSpace
           Sys      = ($n -eq $sys)
-          Writable = (Test-BwRootWritable ($n + '\'))
+          Writable = (Test-BwDriveUsable ($n + '\'))
         }
         if ($dr.DriveType -eq [System.IO.DriveType]::Fixed) { $fixed += $item }
         elseif ($dr.DriveType -eq [System.IO.DriveType]::Network) { $net += $item }
@@ -94,14 +171,17 @@ function Get-BwDriveChoices {
           Free     = [long]$dr.AvailableFreeSpace
           Sys      = ($n -eq $sys)
           Net      = $net
-          Writable = (Test-BwRootWritable ($n + '\'))
+          Writable = (Test-BwDriveUsable ($n + '\'))
         }
       } catch {}
     }
   } catch {}
   if ($list.Count -eq 0) { return @() }
-  # 能写的排前面, 其次非系统盘, 同档按可用空间从大到小。
-  # 这样用户看到的第一个就是真正能用的, 不用自己踩坑。
+  # 能用的排前面, 其次非系统盘, 同档按可用空间从大到小 —— 第一个就是推荐值。
+  # 排序只决定"谁排前面", **不筛掉任何盘**: 所有盘都要在向导里让用户自己选。
+  # 原因是"这个盘能不能写"是每台机器各自的权限设置, 不是程序的产品规则;
+  # 把用不了的盘从列表里剔除, 用户会以为"这程序不支持我的盘", 那是误导。
+  # (v1.2.2 就是这么干的, 属于过度纠正, v1.2.3 改回来。)
   return @($list | Sort-Object @{ Expression = { if ($_.Writable) { 0 } else { 1 } } },
                                   @{ Expression = { if ($_.Sys) { 1 } else { 0 } } },
                                   @{ Expression = { $_.Free }; Descending = $true })
@@ -119,22 +199,20 @@ function Get-BwDefaults {
 # 目录不存在就建。建不成(权限/盘被拔了)返回 $false, 让调用方说人话, 而不是抛一堆栈。
 function Ensure-BwDirs {
   $c = Get-BwConfig
-  foreach ($d in @($c.bing_save_dir, $c.spotlight_save_dir)) {
-    if (-not $d) { continue }
-    if (-not (Test-Path -LiteralPath $d)) {
-      try { New-Item -LiteralPath $d -ItemType Directory -Force -ErrorAction Stop | Out-Null } catch {}
-    }
-  }
+  [void](New-BwDir $c.bing_save_dir)
+  [void](New-BwDir $c.spotlight_save_dir)
   return [bool](Test-Path -LiteralPath $c.bing_save_dir)
 }
-# 真写一个临时文件再删, 比只看目录能不能访问准
+# 真写一个临时文件再删, 比只看目录能不能访问准。
+# 全程 .NET —— 之前用 New-Item/Set-Content/Remove-Item 的 -LiteralPath,
+# 本机 New-Item 没这个参数会抛异常, 于是所有目录都被判成不可写(假阴性)。
 function Test-BwWritable([string]$dir) {
   if (-not $dir) { return $false }
+  if (-not (New-BwDir $dir)) { return $false }
   try {
-    if (-not (Test-Path -LiteralPath $dir)) { New-Item -LiteralPath $dir -ItemType Directory -Force -ErrorAction Stop | Out-Null }
     $t = Join-Path $dir ('.wtest_' + [guid]::NewGuid().ToString('N'))
-    Set-Content -LiteralPath $t -Value 'x' -Encoding ASCII -ErrorAction Stop
-    Remove-Item -LiteralPath $t -Force -ErrorAction SilentlyContinue
+    [System.IO.File]::WriteAllText($t, 'x', [System.Text.Encoding]::ASCII)
+    [System.IO.File]::Delete($t)
     return $true
   } catch { return $false }
 }
