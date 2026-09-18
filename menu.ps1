@@ -1,7 +1,20 @@
 ﻿# 微软壁纸助手 - 单层菜单 (by 海风 & 小腾)
 . (Join-Path $PSScriptRoot 'core.ps1')
 
-$global:BWVersion = '1.2.0'
+$global:BWVersion = '1.2.1'
+
+# 把用户按键归一化: 去首尾空格 + 全角转半角 + 转小写。
+# 中文输入法很容易把 o 打成全角 ｏ, 不归一化就变成"按了键没反应"。
+function Normalize-BwKey([string]$s) {
+  if (-not $s) { return '' }
+  $out = foreach ($ch in $s.Trim().ToCharArray()) {
+    $c = [int][char]$ch
+    if ($c -eq 0x3000) { ' ' }
+    elseif ($c -ge 0xFF01 -and $c -le 0xFF5E) { [char]($c - 0xFEE0) }
+    else { $ch }
+  }
+  return ((-join $out).Trim()).ToLower()
+}
 
 function Pause-Bw { Write-Host ''; Read-Host '  按回车返回菜单' | Out-Null }
 function Today-Str { return (Get-Date -Format 'yyyy-MM-dd') }
@@ -41,9 +54,9 @@ function Show-BrowseAll {
   Write-Host ('  所在文件夹: ' + $c.bing_save_dir)
   $i = 0
   foreach ($f in $files) { Write-Host ("  [$i] [$($f.src)] $($f.file.Name)"); $i++ }
-  $sel = Read-Host '  输入序号设为壁纸 (输入 o 打开文件夹, 回车返回)'
+  $sel = Normalize-BwKey (Read-Host '  输入序号设为壁纸 (输入 o 打开文件夹, 回车返回)')
   if ($sel -eq '') { return }
-  if ($sel -eq 'o' -or $sel -eq 'O') {
+  if ($sel -eq 'o') {
     Open-BwDir $c.bing_save_dir
     Open-BwDir $c.spotlight_save_dir
     return
@@ -60,12 +73,12 @@ function Show-BrowseAll {
 function Show-Archive {
   Write-Host '  归档范围: 2021-02 至今 (开源仓库 niumoo/bing-wallpaper, 4K UHD)'
   $ym = Read-Host '  输入年-月 (如 2024-08), 回车返回'
-  if ($ym -eq 'r' -or $ym -eq '') { return }
+  if ((Normalize-BwKey $ym) -eq 'r' -or $ym -eq '') { return }
   $items = Get-BwMonthItems $ym
   if (-not $items -or $items.Count -eq 0) { Write-Host '  未取到清单或该月不存在'; Pause-Bw; return }
   $items | ForEach-Object { Write-Host ("    $($_.date)  $($_.code)") }
   Write-Host '  [1] 批量下载本月全部   [2] 单张设为壁纸   [3] 单张仅保存   [0] 返回'
-  $k = Read-Host '  选择'
+  $k = Normalize-BwKey (Read-Host '  选择')
   if ($k -eq '1') { Invoke-BwArchiveBatch $ym; Pause-Bw }
   elseif ($k -eq '2' -or $k -eq '3') {
     $d = Read-Host '  输入日期 (如 2024-08-15)'
@@ -118,13 +131,13 @@ function Edit-BwSettings {
   Write-Host ('  必应库: ' + $c.bing_save_dir)
   Write-Host ('  聚焦库: ' + $c.spotlight_save_dir)
   Write-Host ''
-  $m = Read-Host ('  换图间隔分钟 (现在 ' + $c.cycle_minutes + ', 回车不变)')
+  $m = Normalize-BwKey (Read-Host ('  换图间隔分钟 (现在 ' + $c.cycle_minutes + ', 回车不变)'))
   if ($m -match '^\d+$' -and [int]$m -gt 0) { $c.cycle_minutes = [int]$m }
-  $n = Read-Host ('  每轮下载张数 (现在 ' + $c.spotlight_per_cycle + ', 回车不变)')
+  $n = Normalize-BwKey (Read-Host ('  每轮下载张数 (现在 ' + $c.spotlight_per_cycle + ', 回车不变)'))
   if ($n -match '^\d+$' -and [int]$n -gt 0) { $c.spotlight_per_cycle = [int]$n }
 
   $b = Read-Host '  必应库位置 (回车不变, 输入 o 打开文件夹)'
-  if ($b -eq 'o' -or $b -eq 'O') { Open-BwDir $c.bing_save_dir }
+  if ((Normalize-BwKey $b) -eq 'o') { Open-BwDir $c.bing_save_dir }
   elseif ($b) {
     if (-not (Test-BwPathShape $b)) { Write-Host '  要写完整路径, 比如 D:\壁纸\必应 —— 已保持不变' }
     elseif (Test-BwWritable $b) { $c.bing_save_dir = $b; Write-Host ('  已设为 ' + $b) }
@@ -132,7 +145,7 @@ function Edit-BwSettings {
   }
 
   $d = Read-Host '  聚焦库位置 (回车不变, 输入 o 打开文件夹)'
-  if ($d -eq 'o' -or $d -eq 'O') { Open-BwDir $c.spotlight_save_dir }
+  if ((Normalize-BwKey $d) -eq 'o') { Open-BwDir $c.spotlight_save_dir }
   elseif ($d) {
     if (-not (Test-BwPathShape $d)) { Write-Host '  要写完整路径, 比如 D:\壁纸\聚焦 —— 已保持不变' }
     elseif (Test-BwWritable $d) { $c.spotlight_save_dir = $d; Write-Host ('  已设为 ' + $d) }
@@ -159,10 +172,31 @@ function Invoke-BwFirstRun {
   Write-Host ''
   Write-Host '  图片全部存在你自己电脑上, 不往任何服务器上传东西。'
   Write-Host ''
+  $choices = @(Get-BwDriveChoices)
+  if ($choices.Count -gt 0) {
+    Write-Host '  C 盘以外的盘都可以放, 按可用空间从大到小:'
+    Write-Host ''
+    $ci = 0
+    foreach ($ch in $choices) {
+      $mark = ''
+      if ($ch.Sys) { $mark = '  (系统盘, 不推荐)' }
+      elseif ($ci -eq 0) { $mark = '  <-- 推荐' }
+      Write-Host ('   [{0}] {1}\微软壁纸助手   可用 {2} GB{3}' -f ($ci + 1), $ch.Name, [math]::Round($ch.Free / 1GB, 1), $mark)
+      $ci++
+    }
+    Write-Host ''
+  }
   Write-Host ('  建议保存到: ' + $d.base) -ForegroundColor Green
-  $in = Read-Host '  直接回车接受, 或输入别的完整路径'
+  $in = Read-Host '  回车 = 接受推荐位置, 也可直接输入上面的序号或一个完整路径'
   $base = $d.base
-  if ($in) { $base = $in.Trim().Trim('"') }
+  if ($in) {
+    $t = $in.Trim().Trim('"')
+    if (($t -match '^\d+$') -and ([int]$t -ge 1) -and ([int]$t -le $choices.Count)) {
+      $base = Join-Path (($choices[[int]$t - 1].Name) + '\') '微软壁纸助手'
+    } else {
+      $base = $t
+    }
+  }
 
   if (-not (Test-BwPathShape $base)) {
     Write-Host ''
@@ -235,6 +269,9 @@ function Toggle-BwAutoStart {
       return
     }
     try {
+      # 清掉可能残留的 daemon.stop —— 不清的话刚拉起来的后台会立刻自己退掉
+      $sf = Join-Path $global:BWRoot 'daemon.stop'
+      if (Test-Path -LiteralPath $sf) { Remove-Item -LiteralPath $sf -Force -ErrorAction SilentlyContinue }
       $sh = New-Object -ComObject WScript.Shell
       $sc = $sh.CreateShortcut($lnk)
       $sc.TargetPath       = $exe
@@ -281,8 +318,11 @@ do {
   Write-Host ' [9] 打开保存壁纸的文件夹'
   Write-Host ' [A] 开机自动换壁纸  开 / 关'
   Write-Host ' [L] 查看运行日志'
-  Write-Host ' [0] 退出'
-  $k = Read-Host '请选择'
+  Write-Host ' [Q] 退出   (按 0 或 o 也一样)'
+  $k = Normalize-BwKey (Read-Host '请选择')
+  $quit = $false
+  # 注意: PowerShell 的 switch 对字符串大小写不敏感, 且匹配到的子句"每个都会执行"。
+  # 所以这里每个键只写一条小写子句 —— 写 'a' 和 'A' 两条会让开关被切两次 (等于没切)。
   switch ($k) {
     '1' { Invoke-BwManualSwap; Pause-Bw }
     '2' { Invoke-BwUpdate; Pause-Bw }
@@ -294,8 +334,14 @@ do {
     '8' { Edit-BwSettings; Pause-Bw }
     '9' { Open-BwDir (Get-BwConfig).bing_save_dir; Open-BwDir (Get-BwConfig).spotlight_save_dir }
     'a' { Toggle-BwAutoStart; Pause-Bw }
-    'A' { Toggle-BwAutoStart; Pause-Bw }
     'l' { Get-Content $global:BWLog -Tail 40 -Encoding UTF8 -ErrorAction SilentlyContinue; Pause-Bw }
-    'L' { Get-Content $global:BWLog -Tail 40 -Encoding UTF8 -ErrorAction SilentlyContinue; Pause-Bw }
+    # 退出: 主标识是 Q, 但 0 和 o 也认 —— 菜单里那个 [0] 老被看成字母 O
+    'q' { $quit = $true }
+    '0' { $quit = $true }
+    'o' { $quit = $true }
+    default {
+      Write-Host ('  「' + $k + '」不是菜单里的选项, 请输入方括号里的数字或字母')
+      Start-Sleep -Milliseconds 900
+    }
   }
-} while ($k -ne '0')
+} while (-not $quit)

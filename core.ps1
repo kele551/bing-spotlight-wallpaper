@@ -29,7 +29,10 @@ function Get-BwPickRoot {
         if (-not $dr.IsReady) { continue }
         $n = ([string]$dr.Name).TrimEnd('\')
         if ((-not $n) -or ($n -eq 'A:') -or ($n -eq 'B:')) { continue }
-        $item = [psobject]@{ Name = $n; Free = [long]$dr.AvailableFreeSpace; Sys = ($n -eq $sys) }
+        # 必须是 [PSCustomObject]。写成 [psobject]@{} 或 @{} 得到的是 Hashtable,
+        # Sort-Object 取不到 .Free 属性 -> 排序**静默失效**, 结果按枚举顺序倒着来,
+        # 实测恒返回 F: (哪怕 E: 的可用空间是它的两倍)。
+        $item = [PSCustomObject]@{ Name = $n; Free = [long]$dr.AvailableFreeSpace; Sys = ($n -eq $sys) }
         if ($dr.DriveType -eq [System.IO.DriveType]::Fixed) { $fixed += $item }
         elseif ($dr.DriveType -eq [System.IO.DriveType]::Network) { $net += $item }
       } catch {}
@@ -41,6 +44,29 @@ function Get-BwPickRoot {
   if ($pick.Count -gt 0) { $global:BWPickRoot = ($pick[0].Name + '\') }
   else { $global:BWPickRoot = (Join-Path $env:USERPROFILE 'Pictures') }
   return $global:BWPickRoot
+}
+# 给首次运行向导用: 列出能拿来存壁纸的盘, 非系统盘排在前面, 同档按可用空间从大到小。
+# 只要盘还在、能访问就算候选 —— C 盘以外任何一个盘都可以, 用户自己挑。
+function Get-BwDriveChoices {
+  $sys = ''
+  try { $sys = ([string]$env:SystemDrive).TrimEnd('\') } catch {}
+  $list = @()
+  try {
+    foreach ($dr in [System.IO.DriveInfo]::GetDrives()) {
+      try {
+        if (-not $dr.IsReady) { continue }
+        $n = ([string]$dr.Name).TrimEnd('\')
+        if ((-not $n) -or ($n -eq 'A:') -or ($n -eq 'B:')) { continue }
+        $net = ($dr.DriveType -eq [System.IO.DriveType]::Network)
+        if ((-not $net) -and ($dr.DriveType -ne [System.IO.DriveType]::Fixed)) { continue }
+        $list += [PSCustomObject]@{ Name = $n; Free = [long]$dr.AvailableFreeSpace; Sys = ($n -eq $sys); Net = $net }
+      } catch {}
+    }
+  } catch {}
+  if ($list.Count -eq 0) { return @() }
+  $nonSys = @($list | Where-Object { -not $_.Sys } | Sort-Object Free -Descending)
+  $sysLst = @($list | Where-Object { $_.Sys } | Sort-Object Free -Descending)
+  return @($nonSys + $sysLst)
 }
 function Get-BwDefaults {
   if ($global:BWDefaults) { return $global:BWDefaults }
