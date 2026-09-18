@@ -186,13 +186,64 @@ function Get-BwDriveChoices {
                                   @{ Expression = { if ($_.Sys) { 1 } else { 0 } } },
                                   @{ Expression = { $_.Free }; Descending = $true })
 }
+# ---- 系统「图片」文件夹的真实位置 ----
+# 这个文件夹是可以被改到别处的 (资源管理器里右键「图片」- 属性 - 位置 - 移动),
+# 所以不能写死 C:\Users\xxx\Pictures。三档兜底: .NET -> 注册表 -> 主目录下的 Pictures。
+function Get-BwPicturesDir {
+  if ($global:BWPicturesDir) { return $global:BWPicturesDir }
+  $p = ''
+  try { $p = [string][Environment]::GetFolderPath('MyPictures') } catch { $p = '' }
+  if (-not $p) {
+    try {
+      $v = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders' -Name 'My Pictures' -ErrorAction Stop).'My Pictures'
+      if ($v) { $p = [Environment]::ExpandEnvironmentVariables([string]$v) }
+    } catch {}
+  }
+  if (-not $p) { $p = (Join-Path $env:USERPROFILE 'Pictures') }
+  $global:BWPicturesDir = $p
+  return $global:BWPicturesDir
+}
+# ---- 壁纸默认放「图片」文件夹里的「壁纸」----
+# 用户的安排: 壁纸就该归在图片库里, 不要再往盘根丢一个 X:\微软壁纸助手。
+# 但有个现实问题: 图片文件夹默认就在系统盘 (C:\Users\xxx\Pictures),
+#   壁纸每天都攒, 几年下来好几个 GB, 会把系统盘撑满。所以:
+#     * 图片文件夹在系统盘以外 -> 直接用 <图片>\壁纸 (尊重用户自己的安排)
+#     * 图片文件夹在系统盘     -> 挑一个非系统盘, 用 <盘>\图片\壁纸
+#     * 这台机器只有系统盘     -> 只能用 <图片>\壁纸, 并在向导里说清楚
+# 挑盘的规则沿用 Get-BwPickRoot (非系统盘优先、可写优先、可用空间降序)。
+function Get-BwDefaultBase {
+  if ($global:BWDefaultBase) { return $global:BWDefaultBase }
+  $pic = Get-BwPicturesDir
+  $sys = ''
+  try { $sys = (([string]$env:SystemDrive).TrimEnd('\')).ToUpper() } catch {}
+  $drv = ''
+  if ($pic -match '^([A-Za-z]):') { $drv = $Matches[1].ToUpper() }
+  if ($drv -and ($drv -ne $sys)) {
+    $global:BWDefaultBase = (Join-Path $pic '壁纸')
+    $global:BWBaseReason  = '你的「图片」文件夹本来就在系统盘以外'
+  } else {
+    $root = ''
+    try { $root = ([string](Get-BwPickRoot)).TrimEnd('\') } catch {}
+    $rd = ''
+    if ($root -match '^([A-Za-z]):') { $rd = $Matches[1].ToUpper() }
+    if ($rd -and ($rd -ne $sys)) {
+      $global:BWDefaultBase = (Join-Path $root '图片\壁纸')
+      $global:BWBaseReason  = '「图片」文件夹在系统盘上, 已经挪到系统盘以外, 免得壁纸越攒越多把系统盘撑满'
+    } else {
+      $global:BWDefaultBase = (Join-Path $pic '壁纸')
+      $global:BWBaseReason  = '这台机器只有系统盘能用'
+    }
+  }
+  return $global:BWDefaultBase
+}
 function Get-BwDefaults {
   if ($global:BWDefaults) { return $global:BWDefaults }
-  $base = Join-Path (Get-BwPickRoot) '微软壁纸助手'
-  $global:BWDefaults = [psobject]@{
+  $base = Get-BwDefaultBase
+  $global:BWDefaults = [PSCustomObject]@{
     base      = $base
     bing      = (Join-Path $base '必应')
     spotlight = (Join-Path $base '聚焦')
+    reason    = $global:BWBaseReason
   }
   return $global:BWDefaults
 }
@@ -252,18 +303,27 @@ function Get-BwState {
   }
   $ver = 0
   if ($s) { try { $ver = [int]$s.schema } catch { $ver = 0 } }
-  if ($ver -ne 3) {
-    if ($existed) { Log ('节奏进度文件版本 ' + $ver + ' -> 3, 已重置 (下一次运行会重新切一次必应当日图)') }
+  if ($ver -lt 3) {
+    # 3 以前的结构不一样, 没法迁, 重置
+    if ($existed) { Log ('节奏进度文件版本 ' + $ver + ' -> 4, 结构变了, 已重置 (下一次运行会重新切一次必应当日图)') }
     $s = New-Object PSObject
+  } elseif ($ver -eq 3) {
+    # 3 -> 4 只是多了两个字段, 原有的换图进度全部保留
+    Log '节奏进度文件 3 -> 4: 保留原有进度, 新增必应水位线'
   }
+  # bing_high_date : 必应补漏的水位线, 只往前不后退 (详见 Get-BwHighDate)
   $def = [ordered]@{
-    schema = 3; last_bing_date = ''; last_swap = ''; last_boot = ''
+    schema = 4; last_bing_date = ''; last_swap = ''; last_boot = ''
     queue = @(); refills = 0; shown = 0; last_wall = ''
+    bing_high_date = ''
   }
   foreach ($k in $def.Keys) {
     $p = $s.PSObject.Properties[$k]
     if ((-not $p) -or ($null -eq $p.Value)) { Add-Member -InputObject $s NoteProperty $k $def[$k] -Force }
   }
+  # schema 要**强制**写成当前版本: 上面那个循环只在"字段缺失或为空"时才补,
+  # 而 schema 永远是 3 (有值), 于是升完级还是 3, 每次进来都要再"升级"一遍。
+  Add-Member -InputObject $s NoteProperty schema 4 -Force
   return $s
 }
 function Save-BwState($s) {
@@ -284,9 +344,13 @@ function Set-BwWall([string]$path) {
 # ---- 聚焦库 ----
 # 一律返回"普通数组"。不要写 `return ,@(...)` —— 它在 @(f).Count / f | Where-Object
 # 下会把整个数组当成一个元素, 导致"库里有 60 张"被看成"1 张"、过滤整个失效。
+# 只认库根目录下这一层的 .jpg, 不往子目录里钻。
+# 用户会自己整理图片 (建子目录、挪地方、删掉), 程序得给一个稳定可预期的口径:
+# 「库里有几张」== 「能轮换到几张」。递归的话这两个数会对不上 ——
+# 菜单显示 124 张, 队列里却只有 100 张能用, 看着像程序漏了图。
 function Get-BwSpotlightAll {
   $c = Get-BwConfig
-  return @(Get-ChildItem $c.spotlight_save_dir -Filter *.jpg -ErrorAction SilentlyContinue)
+  return @(Get-ChildItem -LiteralPath $c.spotlight_save_dir -File -Filter *.jpg -ErrorAction SilentlyContinue)
 }
 function Get-BwSpotlightWant {
   $c = Get-BwConfig
@@ -300,12 +364,31 @@ function Get-BwFreshQueue {
   if ($names.Count -eq 0) { return @() }
   return @($names | Sort-Object { Get-Random })
 }
+# 队列里存的是文件名, 而图随时可能被用户自己删掉或挪到别处 —— 这是完全正常的操作,
+# 不是故障。所以每次取图之前先把"已经不在库里"的名字一次性剔掉, 而不是等轮到它
+# 才发现不存在、一张一张慢慢淘汰 (队列上百张时能明显感到卡)。
+# 注意: 库目录整个不见了 (移动硬盘没插、网络盘没连上) 时**不动队列** ——
+# 那种情况只是暂时读不到, 清掉队列等于把用户的轮换进度白丢了。
+function Sync-BwQueue($s) {
+  $c = Get-BwConfig
+  $dir = $c.spotlight_save_dir
+  if (-not (Test-Path -LiteralPath $dir)) { return 0 }
+  $live = @{}
+  foreach ($f in @(Get-BwSpotlightAll)) { $live[[string]$f.Name] = $true }
+  $before = @($s.queue | Where-Object { $_ }).Count
+  if ($before -eq 0) { return 0 }
+  $s.queue = @($s.queue | Where-Object { $_ -and $live.ContainsKey([string]$_) })
+  $gone = $before - @($s.queue).Count
+  if ($gone -gt 0) { Log ('队列里有 ' + $gone + ' 张已经不在库里 (被删除或移到别处), 已剔除') }
+  return $gone
+}
 # 取队列里下一张。队列空了(或剩下的图被手动删了) -> 下载一批新的重洗。
 # 好处: 洗牌后的队列总有图可取, 所以不需要"抓不到新图就清空历史"那种兜底分支,
 # 也就不会有"挑不出图 -> 永远不换壁纸"的死局。
 function Get-BwNextWall($s) {
   $c = Get-BwConfig
   for ($round = 1; $round -le 2; $round++) {
+    [void](Sync-BwQueue $s)
     $q = @($s.queue | Where-Object { $_ })
     while ($q.Count -gt 0) {
       $name = [string]$q[0]
@@ -404,7 +487,8 @@ function Save-BwFile([string[]]$urls, [string]$path) {
         Log "下载成功: $(Split-Path $path -Leaf) ($dim)"
         return $true
       }
-      if (Test-Path $path) { Remove-Item $path -Force }
+      # 走 .NET 删: 本机 Remove-Item 走回收站, 中文路径下会报 trash 失败
+      if (Test-Path -LiteralPath $path) { try { [System.IO.File]::Delete($path) } catch {} }
     } catch { Log ('下载失败: ' + $_.Exception.Message) }
   }
   return $false
@@ -435,7 +519,7 @@ function Invoke-BwArchiveBatch([string]$ym) {
     $path = Get-BwTargetPath $it.date (Get-BwMonthName $it)
     if (Test-Path $path) { $skip++; continue }
     $dir = Split-Path $path -Parent
-    if (-not (Test-Path $dir)) { New-Item $dir -ItemType Directory -Force | Out-Null }
+    [void](New-BwDir $dir)
     if (Save-BwFile @($it.url) $path) { $ok++ } else { $fail++ }
     Start-Sleep -Milliseconds 400
   }
@@ -448,14 +532,14 @@ function Invoke-BwArchiveSingle([string]$ym, [string]$date, [switch]$SetWall) {
   if (-not $it) { Write-Host '  该日期不存在于当月清单'; return }
   $path = Get-BwTargetPath $it.date (Get-BwMonthName $it)
   $dir = Split-Path $path -Parent
-  if (-not (Test-Path $dir)) { New-Item $dir -ItemType Directory -Force | Out-Null }
+  [void](New-BwDir $dir)
   if (-not (Test-Path $path)) { if (-not (Save-BwFile @($it.url) $path)) { Write-Host '  下载失败'; return } }
   if ($SetWall) { $ok = Set-BwDesktopWallpaper $path; Write-Host ("  已设为壁纸: ok=$ok") } else { Write-Host ("  已保存: $path") }
 }
 function Invoke-BwRandom {
   $c = Get-BwConfig
-  $all = @(Get-ChildItem $c.bing_save_dir -Recurse -Filter *.jpg -ErrorAction SilentlyContinue) +
-         @(Get-ChildItem $c.spotlight_save_dir -Recurse -Filter *.jpg -ErrorAction SilentlyContinue)
+  $all = @(Get-ChildItem -LiteralPath $c.bing_save_dir -File -Filter *.jpg -ErrorAction SilentlyContinue) +
+         @(Get-ChildItem -LiteralPath $c.spotlight_save_dir -File -Filter *.jpg -ErrorAction SilentlyContinue)
   if ($all.Count -eq 0) { Write-Host '  两个壁纸库都是空的'; return }
   $f = $all | Get-Random -Count 1
   $ok = Set-BwDesktopWallpaper $f.FullName
@@ -468,7 +552,7 @@ function Invoke-BwRandom {
 # 只下载不切壁纸; 文件在就跳过, 幂等, 补完之后每次自检秒过。
 function Get-BwLatestDate([string]$dir) {
   $latest = $null
-  foreach ($f in @(Get-ChildItem $dir -Filter *.jpg -ErrorAction SilentlyContinue)) {
+  foreach ($f in @(Get-ChildItem -LiteralPath $dir -File -Filter *.jpg -ErrorAction SilentlyContinue)) {
     if ($f.Name -match '^(\d{4}-\d{2}-\d{2})') {
       $d = $null
       try { $d = [DateTime]::ParseExact($Matches[1], 'yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture) } catch {}
@@ -477,10 +561,44 @@ function Get-BwLatestDate([string]$dir) {
   }
   return $latest
 }
-function Invoke-BwBackfill {
+function Get-BwBingAll {
+  $c = Get-BwConfig
+  return @(Get-ChildItem -LiteralPath $c.bing_save_dir -File -Filter *.jpg -ErrorAction SilentlyContinue)
+}
+# 补漏的起点 = 「库里最新日期」和「水位线」里更晚的那个。
+#
+# 为什么需要水位线: 用户把最近几天的必应图删掉或者挪走, 是很正常的操作。
+# 只按"库里最新"算的话, 水位会跟着往回退好几天, 于是程序会把用户刚删掉的那些天
+# 再下载一遍 —— 删了又自己回来, 等于变相不许人删。
+# 水位线只往前不后退, 所以删图不会引起重复下载; 它记的是"这件事已经办到哪天了",
+# 不是"现在库里还有多少张"。
+function Get-BwHighDate($s, [string]$dir) {
+  $latest = Get-BwLatestDate $dir
+  $high = $null
+  if ($s.bing_high_date) {
+    try { $high = [DateTime]::ParseExact([string]$s.bing_high_date, 'yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture) } catch { $high = $null }
+  }
+  if (-not $high) {
+    # 水位线还是空的 (从老版本升级上来的): 就地用库里最新日期把它立起来,
+    # 这样"删掉最新那几张"从这一刻起也不会引起回退。
+    if ($latest) { $s.bing_high_date = $latest.ToString('yyyy-MM-dd') }
+    return $latest
+  }
+  if ((-not $latest) -or ($high -gt $latest)) { return $high }
+  return $latest
+}
+# 水位只往前推。'yyyy-MM-dd' 的字典序等于时间序, 直接比字符串就行。
+function Set-BwHighDate($s, [string]$day) {
+  if (-not $day) { return }
+  $cur = ''
+  if ($s.bing_high_date) { $cur = [string]$s.bing_high_date }
+  if ($day -gt $cur) { $s.bing_high_date = $day }
+}
+function Invoke-BwBackfill($s) {
+  if (-not $s) { $s = Get-BwState }
   $c = Get-BwConfig
   $today = Get-Date
-  $latest = Get-BwLatestDate $c.bing_save_dir
+  $latest = Get-BwHighDate $s $c.bing_save_dir
   if (-not $latest) { return }
   $first = $latest.AddDays(1)
   $yesterday = $today.AddDays(-1)
@@ -516,6 +634,9 @@ function Invoke-BwBackfill {
   if (($ok + $skip + $fail) -gt 0) {
     Log ('补漏 ' + $missing[0].ToString('yyyy-MM-dd') + ' ~ ' + $missing[$missing.Count - 1].ToString('yyyy-MM-dd') + ': 新增 ' + $ok + ' 已有 ' + $skip + ' 失败 ' + $fail)
   }
+  # 补到哪天, 水位就记到哪天 —— 之后用户把这几张删了也不会再补一次
+  Set-BwHighDate $s $missing[$missing.Count - 1].ToString('yyyy-MM-dd')
+  Save-BwState $s
 }
 # ---- Windows 聚焦图源 (微软官方桌面聚焦, 3840x2160, 与 Bing 壁纸同一壁纸团队) ----
 function Get-SpotlightOne {
@@ -557,7 +678,7 @@ function Invoke-SpotlightFetch([int]$count, [switch]$SetWall, [switch]$Quiet) {
   # 返回本次新增的文件全名数组, 调用方可以立刻把它们排进轮换队列。
   $c = Get-BwConfig
   $dir = $c.spotlight_save_dir
-  if (-not (Test-Path $dir)) { New-Item $dir -ItemType Directory -Force | Out-Null }
+  [void](New-BwDir $dir)
   $ok = 0; $skip = 0; $fail = 0; $first = $null
   $newFiles = @()
   $tries = 0
@@ -591,7 +712,7 @@ function Invoke-SpotlightFetch([int]$count, [switch]$SetWall, [switch]$Quiet) {
 }
 # 浏览任意一个库, 选一张设为壁纸 (必应库 / 聚焦库共用)
 function Show-Browse([string]$dir, [string]$title) {
-  $files = @(Get-ChildItem $dir -Recurse -Filter *.jpg -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 40)
+  $files = @(Get-ChildItem -LiteralPath $dir -File -Filter *.jpg -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 40)
   if ($files.Count -eq 0) { Write-Host ('  ' + $title + '还是空的'); return }
   Write-Host ('  —— ' + $title + ' (最近 40 张) ——')
   $i = 0
@@ -619,7 +740,7 @@ function Invoke-BwUpdate {
     $name = Get-BwName $meta
     $path = Get-BwTargetPath (Get-BwDisplayDate $meta) $name
     $dir = Split-Path $path -Parent
-    if (-not (Test-Path $dir)) { New-Item $dir -ItemType Directory -Force | Out-Null }
+    [void](New-BwDir $dir)
     if (-not (Test-Path $path)) {
       if (-not (Save-BwFile (Get-BwCandidates $meta ($c.resolution_mode)) $path)) { Log '巡检: 下载失败, 下次再试'; return }
       Log ('巡检: 官方已更新 -> ' + $name)
@@ -658,7 +779,7 @@ function Invoke-BwCycle {
     if ($last) { $due = ((($now - $last).TotalMinutes) -ge $gap) }
 
     # ---- 补漏: 错过日子的必应壁纸 (只下载, 不切壁纸) ----
-    Invoke-BwBackfill
+    Invoke-BwBackfill $s
 
     # ---- 规则 1: 每天第一次 -> 必应当日壁纸 ----
     # 拿不到元数据就不记账, 让下面的规则照常走, 15 分钟后自然再试一次 ——
@@ -678,7 +799,7 @@ function Invoke-BwCycle {
         $name = Get-BwName $meta
         $path = Get-BwTargetPath $bday $name
         $dir = Split-Path $path -Parent
-        if (-not (Test-Path $dir)) { New-Item $dir -ItemType Directory -Force | Out-Null }
+        [void](New-BwDir $dir)
         if ($global:BWDry) {
           Log ('试运行: 本应换必应当日壁纸 -> ' + $name + ' (库中已存在=' + (Test-Path -LiteralPath $path) + ')')
         } else {

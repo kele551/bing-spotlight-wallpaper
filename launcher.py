@@ -32,7 +32,7 @@ import sys
 import time
 import ctypes
 
-VERSION = '1.2.3'
+VERSION = '1.3.0'
 APP_NAME = '微软壁纸助手'
 DATA_DIR_NAME = '微软壁纸助手数据'
 PAYLOAD_FILES = ['core.ps1', 'menu.ps1', '使用说明.txt', '微软壁纸助手.ico']
