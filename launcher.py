@@ -9,11 +9,14 @@
                         没有"先建控制台再隐藏"的闪窗问题。
     - 开机后台自启    -> 完全不创建控制台, 一个窗口都不会闪。
 
-* 绿色: 所有东西都在 exe 同级的「微软壁纸助手数据」目录里。
-  删掉这个文件夹 = 彻底卸载, 不写注册表、不装计划任务、不需要管理员。
+* 数据放用户目录 (%LOCALAPPDATA%\\微软壁纸助手), 程序 exe 旁边**不放任何东西** ——
+  放在 Program Files 也不会在旁边生出一个数据文件夹。删掉那个目录 = 彻底卸载,
+  不写注册表、不装计划任务、不需要管理员。
+  真要带着数据一起走 (U 盘), 在数据目录里放一个空的 portable.txt 就切回"跟着 exe 走"。
 
 * 首次运行会把内嵌的 core.ps1 / menu.ps1 释放到数据目录, 并记录版本号;
   换新版 exe 后会自动重新释放 (按版本号比对)。
+  从旧版升上来时, exe 旁边那份旧数据会自动搬进用户目录 (复制+校验后才删旧的)。
 
 命令行
 ------
@@ -27,13 +30,14 @@ import json
 import msvcrt
 import os
 import shutil
+import hashlib
 import subprocess
 import sys
 import time
 import datetime
 import ctypes
 
-VERSION = '1.4.0'
+VERSION = '1.5.2'
 APP_NAME = '微软壁纸助手'
 DATA_DIR_NAME = '微软壁纸助手数据'
 PAYLOAD_FILES = ['core.ps1', 'menu.ps1', '使用说明.txt', '微软壁纸助手.ico']
@@ -73,21 +77,128 @@ def writable(d):
         return False
 
 
+# 程序自己重新生成的文件 —— 搬家时不用搬, 新版会自动重放 / 重写
+GENERATED = set(PAYLOAD_FILES) | {'.version', '.files.json', 'launcher.txt'}
+# 老布局 (数据直接摊在 exe 旁边) 时, 清理只认这些名字, 绝不碰别的 —— exe 也在那个目录里
+LEGACY_FILES = {'config.json', 'state.json', 'wallpaper.log', 'desktop_shortcut.json',
+                'daemon.stop', '.version', '.files.json', 'launcher.txt'} | set(PAYLOAD_FILES)
+
+
+def _md5(p):
+    h = hashlib.md5()
+    with open(p, 'rb') as f:
+        for b in iter(lambda: f.read(65536), b''):
+            h.update(b)
+    return h.hexdigest()
+
+
+def _note(dst, msg):
+    """搬家的过程记到数据目录的日志里 —— 真搬错了有据可查。"""
+    try:
+        with open(os.path.join(dst, 'wallpaper.log'), 'a', encoding='utf-8') as fp:
+            fp.write('%s  %s\n' % (datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'), msg))
+    except Exception:
+        pass
+
+
+def legacy_dirs():
+    """exe 旁边可能存在的旧数据位置 (以前的版本留下的)。"""
+    h = here()
+    out = []
+    d = os.path.join(h, DATA_DIR_NAME)
+    if os.path.isdir(d):
+        out.append(d)
+    if any(os.path.isfile(os.path.join(h, f)) for f in ('config.json', 'state.json')):
+        out.append(h)
+    return out
+
+
+def _cleanup_legacy(src, dst):
+    """搬完并校验通过才敢删。两种旧布局分开处理:
+         * 「微软壁纸助手数据」子目录 -> 整个删掉
+         * 数据直接摊在 exe 旁边    -> 只删本程序认识的那几个文件, 别的碰都不碰
+    """
+    try:
+        if os.path.basename(src.rstrip('\\/')) == DATA_DIR_NAME:
+            shutil.rmtree(src)
+        else:
+            for f in os.listdir(src):
+                if f in LEGACY_FILES:
+                    p = os.path.join(src, f)
+                    if os.path.isfile(p):
+                        os.remove(p)
+    except Exception as e:
+        _note(dst, '数据已搬到新位置, 但旧目录没删掉 (%s): %s' % (src, e))
+        return False
+    return True
+
+
+def migrate_into(dst):
+    """把 exe 旁边的旧数据搬进 dst。
+
+    顺序是: 复制 -> 逐文件比对大小+MD5 -> 全部一致才删旧的。
+    任何一个文件对不上就整个停手, 旧目录原样留着, 下次再试 —— 宁可多一个文件夹, 不冒丢配置的风险。
+    """
+    for src in legacy_dirs():
+        if os.path.abspath(src) == os.path.abspath(dst):
+            continue
+        try:
+            names = [f for f in os.listdir(src)
+                     if os.path.isfile(os.path.join(src, f)) and f not in GENERATED]
+        except Exception:
+            continue
+        ok = True
+        moved = 0
+        for f in names:
+            s = os.path.join(src, f)
+            t = os.path.join(dst, f)
+            try:
+                if os.path.isfile(t):
+                    # 目标已经有同名文件: 内容一样就跳过, 不一样就以目标为准, 绝不覆盖
+                    if os.path.getsize(t) == os.path.getsize(s):
+                        if _md5(t) == _md5(s):
+                            continue
+                    continue
+                shutil.copy2(s, t)
+                if os.path.getsize(t) != os.path.getsize(s) or _md5(t) != _md5(s):
+                    ok = False
+                    break
+                moved += 1
+            except Exception as e:
+                ok = False
+                _note(dst, '搬家中断: %s -> %s (%s), 旧目录保留' % (s, t, e))
+                break
+        if not ok:
+            continue
+        if _cleanup_legacy(src, dst):
+            _note(dst, '数据目录已搬到 %s (搬了 %d 个文件, 旧位置 %s 已清掉)' % (dst, moved, src))
+
+
+def appdata_dir():
+    return os.path.join(os.environ.get('LOCALAPPDATA') or os.path.expanduser('~'), APP_NAME)
+
+
 def data_dir():
-    """数据放哪, 按这个顺序找:
-       1) exe 旁边已经有 config.json (老布局 / 便携用法) -> 就地接着用, 配置不搬家
-       2) exe 旁边的「微软壁纸助手数据」子目录      -> 正常绿色布局
-       3) exe 旁边写不进去 (Program Files 之类)      -> 退到 %LOCALAPPDATA%
+    """数据放哪, 按这个顺序定:
+       1) 便携模式: exe 旁边的「微软壁纸助手数据」里放着 portable.txt -> 跟着 exe 走
+       2) 正常:     %LOCALAPPDATA%\\微软壁纸助手
+                    —— 程序爱放哪放哪 (Program Files 也行), 旁边不会多出任何东西
+       3) LOCALAPPDATA 写不进去 (极罕见) -> 才退回 exe 旁边
+       发现 exe 旁边有旧数据 -> 自动搬进 2), 校验通过后再删掉旧的。
     """
     h = here()
-    if os.path.isfile(os.path.join(h, 'config.json')) and writable(h):
-        return h
-    d = os.path.join(h, DATA_DIR_NAME)
+    pd = os.path.join(h, DATA_DIR_NAME)
+    if os.path.isfile(os.path.join(pd, 'portable.txt')) and writable(pd):
+        return pd
+    d = appdata_dir()
     if writable(d):
+        migrate_into(d)
         return d
-    fallback = os.path.join(os.environ.get('LOCALAPPDATA') or os.path.expanduser('~'), APP_NAME)
-    os.makedirs(fallback, exist_ok=True)
-    return fallback
+    if writable(pd):
+        return pd
+    if writable(h):
+        return h
+    return d
 
 
 # ---------------------------------------------------------------- 释放内嵌脚本

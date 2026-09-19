@@ -1,7 +1,7 @@
-# 微软壁纸助手 - 菜单 (by 海风 & 小腾)
+﻿# 微软壁纸助手 - 菜单 (by 海风 & 小腾)
 . (Join-Path $PSScriptRoot 'core.ps1')
 
-$global:BWVersion = '1.4.0'
+$global:BWVersion = '1.5.2'
 
 # 把用户按键归一化: 去首尾空格 + 全角转半角 + 转小写。
 # 中文输入法很容易把 o 打成全角 ｏ, 不归一化就变成"按了键没反应"。
@@ -435,6 +435,8 @@ function Show-BwSettings {
     $deskOn = '开'
     if ([string]$c.desktop_shortcut -eq 'off') { $deskOn = '关' }
     Write-Host ('  [6] 桌面快捷方式    ' + $deskOn)
+    Write-Host ('  [7] 数据目录        ' + $global:BWRoot)
+    Write-Host '  [8] 图标缓存        一键刷新 (图标显示成旧的样子时用)'
     Write-Host ''
     Write-Host '  [q] 返回'
     Write-Host ''
@@ -510,11 +512,16 @@ function Show-BwSettings {
         if ([string]$c2.desktop_shortcut -eq 'off') {
           $c2.desktop_shortcut = 'on'
           Save-BwConfig $c2
+          # 这里是用户主动要建 (可能之前自己删过), 所以把"已经建过"的记号清掉,
+          # 不然程序会认为"你删了就不该再建", 结果什么也不做。
+          $di = Get-BwDeskInfo
+          $di.created = ''
+          Save-BwDeskInfo $di
           $r = Ensure-BwDesktopShortcut
           if ($r -eq 'create' -or $r -eq 'update') {
-            Write-Host ('  已创建: ' + (Get-BwDesktopLnk))
+            Write-Host ('  好了: ' + (Get-BwDesktopLnk))
           } elseif ($r -eq 'ok') {
-            Write-Host '  桌面上已经有了, 不用动。'
+            Write-Host ('  已经有了: ' + (Get-BwDesktopLnk))
           } else {
             Write-Host '  没建成 —— 找不到主程序或桌面不让写。'
           }
@@ -522,8 +529,42 @@ function Show-BwSettings {
           $c2.desktop_shortcut = 'off'
           Save-BwConfig $c2
           $lnk = Get-BwDesktopLnk
-          if (Test-Path -LiteralPath $lnk) { Remove-Item -LiteralPath $lnk -Force -ErrorAction SilentlyContinue }
-          Write-Host '  已关掉, 桌面上的快捷方式也删了。以后不会再自动建。'
+          if ($lnk -and (Test-Path -LiteralPath $lnk)) { Remove-Item -LiteralPath $lnk -Force -ErrorAction SilentlyContinue }
+          $di = Get-BwDeskInfo
+          $di.path = ''
+          Save-BwDeskInfo $di
+          Write-Host '  已关掉, 桌面上的快捷方式也删了。以后不会再自动建。' -ForegroundColor Yellow
+        }
+        Pause-Bw
+      }
+      '7' {
+        Write-Host ''
+        Write-Host ('  数据目录: ' + $global:BWRoot)
+        Write-Host '  配置、收藏名单、换图进度、日志都在这一个文件夹里。'
+        Write-Host '  它不在程序旁边 —— 程序放哪都不会多出一个数据文件夹。'
+        Write-Host ''
+        Write-Host '  [o] 打开这个文件夹    [回车] 返回'
+        $k7 = Normalize-BwKey (Read-Host '  ')
+        if ($k7 -eq 'o') { try { Start-Process -FilePath 'explorer.exe' -ArgumentList $global:BWRoot } catch {} }
+      }
+      '8' {
+        Write-Host ''
+        Write-Host '  正在刷新 Windows 图标缓存 ...' -ForegroundColor DarkGray
+        $ie = Join-Path $env:SystemRoot 'System32\ie4uinit.exe'
+        if (Test-Path -LiteralPath $ie) {
+          try {
+            $p = Start-Process -FilePath $ie -ArgumentList '-ClearIconCache' -Wait -PassThru -WindowStyle Hidden
+            if ($p.ExitCode -eq 0) {
+              Write-Host '  好了。还显示旧图标的话, 把那个文件夹窗口关掉重开一次。'
+              Log ('设置: 刷新图标缓存 (ie4uinit -ClearIconCache) 完成')
+            } else {
+              Write-Host ('  没成功 (退出码 ' + $p.ExitCode + ')。可以用程序目录里的「刷新图标缓存.bat」。')
+            }
+          } catch {
+            Write-Host ('  没跑成: ' + $_.Exception.Message)
+          }
+        } else {
+          Write-Host '  这台机器没有 ie4uinit.exe。用程序目录里的「刷新图标缓存.bat」代替 (会重启一次资源管理器)。'
         }
         Pause-Bw
       }
@@ -534,32 +575,51 @@ function Show-BwSettings {
 }
 
 # ---------- 首次运行向导 ----------
+function Show-BwFirstRunHead {
+  Clear-Host
+  Write-Host ('========== 微软壁纸助手 v' + $global:BWVersion + ' · 首次运行 ==========') -ForegroundColor Cyan
+  Write-Host ''
+  Write-Host '  它做三件事:'
+  Write-Host '    1. 每天把「必应每日一图」存下来, 并设成桌面壁纸'
+  Write-Host '    2. 每半小时换一张「Windows 聚焦」壁纸, 不重复'
+  Write-Host '    3. 几天没开机也不漏图, 错过的必应壁纸会自动补齐'
+  Write-Host ''
+  Write-Host '  图片全部存在你自己电脑上, 不会上传到任何服务器。'
+  Write-Host '  壁纸你随时可以自己删、自己挪到别处, 删了不影响它继续换图。'
+  Write-Host ''
+}
+
 function Invoke-BwFirstRun {
   $d = Get-BwDefaults
+  # 双击就能用: 直接用推荐位置, 不摆一堆选项让客户做选择题。
+  # 只有推荐位置写不进去、一键修复也没修成时, 才回头让人自己挑(极少见)。
   $base = ''
+  $try = [string]$d.base
+  if ($try -and (Test-BwWritable (Join-Path $try '必应')) -and (Test-BwWritable (Join-Path $try '聚焦'))) {
+    $base = $try
+  } else {
+    $fixed = Resolve-BwUnwritableBase $try
+    if ($fixed) { $base = $fixed }
+  }
   while (-not $base) {
-    Clear-Host
-    Write-Host ('========== 微软壁纸助手 v' + $global:BWVersion + ' · 首次运行 ==========') -ForegroundColor Cyan
-    Write-Host ''
-    Write-Host '  它做三件事:'
-    Write-Host '    1. 每天把「必应每日一图」存下来, 并设成桌面壁纸'
-    Write-Host '    2. 每半小时换一张「Windows 聚焦」壁纸, 不重复'
-    Write-Host '    3. 几天没开机也不漏图, 错过的必应壁纸会自动补齐'
-    Write-Host ''
-    Write-Host '  图片全部存在你自己电脑上, 不会上传到任何服务器。'
-    Write-Host '  壁纸你随时可以自己删、自己挪到别处, 删了不影响它继续换图。'
-    Write-Host ''
-    Write-Host '  壁纸存到哪? 下面这些都能选:'
+    Show-BwFirstRunHead
+    Write-Host '  这台机器上推荐的位置写不进去, 你自己挑一个:'
     Write-Host ''
     $sel = Select-BwBase $d.base $d.reason
     if (-not $sel) { continue }
     $base = $sel
     # 位置定了, 但"能写"才是真定了。不能写就地解释 + 给一键修复。
     if ((Test-BwWritable (Join-Path $base '必应')) -and (Test-BwWritable (Join-Path $base '聚焦'))) { break }
-    $fixed = Resolve-BwUnwritableBase $base
-    if ($fixed) { $base = $fixed; break }
+    $fixed2 = Resolve-BwUnwritableBase $base
+    if ($fixed2) { $base = $fixed2; break }
     $base = ''    # 没修成 -> 回到列表重来, 而不是偷偷换到别的地方
   }
+
+  Show-BwFirstRunHead
+  Write-Host ('  壁纸保存在: ' + $base) -ForegroundColor Green
+  if ($d.reason) { Write-Host ('             ' + $d.reason) -ForegroundColor DarkGray }
+  Write-Host '  想换地方: 菜单里按 [S] 设置 - [1]'
+  Write-Host ''
 
   $bing = Join-Path $base '必应'
   $spot = Join-Path $base '聚焦'
@@ -653,7 +713,7 @@ function Repair-BwAutoStart {
     $sc.Arguments        = '--daemon'
     $sc.WorkingDirectory = (Split-Path $want -Parent)
     $sc.Description      = '微软壁纸助手 - 开机自动换壁纸'
-    $sc.IconLocation     = ('{0},0' -f $want)
+    $sc.IconLocation     = (Get-BwIconLocation $want)
     $sc.Save()
     Log ('开机自动换: 快捷方式原先指向 [' + $cur + '], 已改指 [' + $want + ']')
     return $true
@@ -665,18 +725,75 @@ function Repair-BwAutoStart {
 #   · exe 换了地方 -> 改指过去 (挪到哪个盘都跟着)
 #   · exe 被新版本覆盖过 (文件比快捷方式新) -> 重写一遍, 顺带把图标刷新成新版的
 # 在设置 [6] 里关掉之后就完全不动, 也不再自动建。
-function Get-BwDesktopLnk {
-  return (Join-Path ([Environment]::GetFolderPath('Desktop')) '微软壁纸助手.lnk')
+#   · 没有 -> 建一个, **只建这一次** (首次运行就会有)
+#   · exe 换了地方 -> 改指过去 (挪到哪个盘都跟着)
+#   · exe 被新版本覆盖过 (文件比快捷方式新) -> 重写一遍, 顺带把图标刷新成新版的
+#
+# 关键一条: **它建在哪儿, 以后就认哪儿**。
+# 用户把快捷方式收进桌面上的文件夹 (比如「图标」) 是常事, 不能因为他挪了一下,
+# 程序就在桌面根再冒一个出来 —— 那样每次打开菜单桌面上都会多一个。
+# 所以位置记在 config.json 里; 记的位置没了, 先去桌面和一层子目录里找,
+# 找不着且从来没建过才建; 建过又被删掉的, 就不建了 (尊重用户删掉它的决定)。
+# 想重建: 设置 [6] 里关一次再开。
+# 快捷方式的"建在哪儿 / 建没建过"单独存一个小文件, **不写进 config.json**。
+# 理由: 主菜单靠"config.json 在不在"来判断要不要走首次运行向导。
+# 要是建快捷方式时顺手把 config.json 也写了, 用户还没选保存目录, 向导就被跳过,
+# 壁纸会默默存到默认位置 —— 那是替用户做了决定, 不能这么干。
+function Get-BwDeskInfo {
+  $p = Join-Path $global:BWRoot 'desktop_shortcut.json'
+  $o = $null
+  if (Test-Path -LiteralPath $p) {
+    try { $o = Get-Content -LiteralPath $p -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $o = $null }
+  }
+  if (-not $o) { $o = New-Object PSObject }
+  if (-not $o.PSObject.Properties['path'])    { Add-Member -InputObject $o NoteProperty path '' -Force }
+  if (-not $o.PSObject.Properties['created']) { Add-Member -InputObject $o NoteProperty created '' -Force }
+  return $o
 }
-# 返回: create / update / ok / off / fail
-function Ensure-BwDesktopShortcut {
-  $c = Get-BwConfig
-  if ([string]$c.desktop_shortcut -eq 'off') { return 'off' }
-  $want = Get-BwLauncherPath
-  if ((-not $want) -or (-not (Test-Path -LiteralPath $want))) { return 'fail' }
-  $lnk = Get-BwDesktopLnk
-  $sh = $null
-  try { $sh = New-Object -ComObject WScript.Shell } catch { return 'fail' }
+function Save-BwDeskInfo($o) {
+  $p = Join-Path $global:BWRoot 'desktop_shortcut.json'
+  try { [System.IO.File]::WriteAllText($p, ($o | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($false))) } catch {}
+}
+function Get-BwDesktopLnk {
+  $i = Get-BwDeskInfo
+  if ($i.path) { return $i.path }
+  return (Join-Path (Get-BwDesktopDir) '微软壁纸助手.lnk')
+}
+# 桌面在哪。抽成一个函数是因为测试要能把它换成临时目录 ——
+# 不然"首次自动建快捷方式"那条分支只能往真桌面上建, 测试就没法隔离了。
+function Get-BwDesktopDir {
+  return ([Environment]::GetFolderPath('Desktop'))
+}
+# 桌面根目录找不到时, 再往桌面上的一层子目录里找一遍 (用户收进文件夹的情况)
+function Find-BwDesktopLnk {
+  $desk = Get-BwDesktopDir
+  $hit = @()
+  try { $hit = @(Get-ChildItem -LiteralPath $desk -File -Filter '微软壁纸助手.lnk' -ErrorAction SilentlyContinue) } catch { $hit = @() }
+  if ($hit.Count -eq 0) {
+    try {
+      $subs = @(Get-ChildItem -LiteralPath $desk -Directory -ErrorAction SilentlyContinue)
+      foreach ($s in $subs) {
+        $f = @(Get-ChildItem -LiteralPath $s.FullName -File -Filter '微软壁纸助手.lnk' -ErrorAction SilentlyContinue)
+        if ($f.Count -gt 0) { $hit = @($f[0]); break }
+      }
+    } catch {}
+  }
+  if ($hit.Count -gt 0) { return $hit[0].FullName }
+  return ''
+}
+# 快捷方式的图标从哪取: 优先数据目录里那份独立的 .ico 文件, 没有才退回 exe 自己。
+#
+# 为什么不直接用 exe: Windows 的图标缓存是按「exe 的完整路径」记的。老版本 exe 占着
+# 同一个路径时 (比如 D:\Program Files\微软壁纸助手.exe), 即使文件已经换成新版,
+# 缓存里存的还是旧图标 —— 表现为"放桌面一个样、拖进文件夹又一个样"。
+# 独立的 .ico 是另一条路径, 没被旧版本污染过, 显示出来的始终是这张图。
+function Get-BwIconLocation([string]$exe) {
+  $ico = Join-Path $global:BWRoot '微软壁纸助手.ico'
+  if (Test-Path -LiteralPath $ico) { return ('{0},0' -f $ico) }
+  return ('{0},0' -f $exe)
+}
+# 真正写盘的那一步: 返回 create / update / ok / fail
+function Write-BwShortcut($sh, [string]$lnk, [string]$want) {
   $need = 'create'
   if (Test-Path -LiteralPath $lnk) {
     $need = ''
@@ -685,7 +802,7 @@ function Ensure-BwDesktopShortcut {
     if ($cur -ne $want) {
       $need = 'update'      # 指错地方了 (挪过/换过版本)
     } else {
-      # 指向没变, 但 exe 文件本身更新过 -> 重存一次, 让桌面图标跟着新版刷新
+      # 指向没变, 但 exe 文件本身更新过 -> 重存一次, 让图标跟着新版刷新
       $tw = (Get-Item -LiteralPath $want).LastWriteTime
       $tl = (Get-Item -LiteralPath $lnk).LastWriteTime
       if ($tw -gt $tl) { $need = 'update' }
@@ -697,49 +814,103 @@ function Ensure-BwDesktopShortcut {
     $sc.TargetPath       = $want
     $sc.Arguments        = ''
     $sc.WorkingDirectory = (Split-Path $want -Parent)
-    $sc.Description      = '微软壁纸助手 - 双击打开菜单'
-    $sc.IconLocation     = ('{0},0' -f $want)
+    $sc.Description      = ('微软壁纸助手 v' + $global:BWVersion + ' - 双击打开菜单')
+    $sc.IconLocation     = (Get-BwIconLocation $want)
     $sc.Save()
     if ($need -eq 'create') { Log ('桌面快捷方式: 已创建 -> ' + $lnk) }
     else { Log ('桌面快捷方式: 已更新, 指向 [' + $want + ']') }
     return $need
   } catch { return 'fail' }
 }
-function Test-BwAutoStart { return (Test-Path -LiteralPath (Get-BwStartupLnk)) }
-function Toggle-BwAutoStart {
-  $lnk = Get-BwStartupLnk
-  if (Test-BwAutoStart) {
-    try { Remove-Item -LiteralPath $lnk -Force } catch {}
-    # 告诉还在后台跑的 daemon 收工
-    try { Set-Content -LiteralPath (Join-Path $global:BWRoot 'daemon.stop') -Value 'stop' -Encoding ASCII } catch {}
-    Write-Host '  已关闭开机自动换壁纸。'
-  } else {
-    $exe = Get-BwLauncherPath
-    if ((-not $exe) -or (-not (Test-Path -LiteralPath $exe))) {
-      Write-Host '  找不到主程序「微软壁纸助手.exe」。'
-      Write-Host '  请直接双击那个 exe 打开本菜单, 再来开这个开关。'
-      return
-    }
-    try {
-      # 清掉可能残留的 daemon.stop —— 不清的话刚拉起来的后台会立刻自己退掉
-      $sf = Join-Path $global:BWRoot 'daemon.stop'
-      if (Test-Path -LiteralPath $sf) { Remove-Item -LiteralPath $sf -Force -ErrorAction SilentlyContinue }
-      $sh = New-Object -ComObject WScript.Shell
-      $sc = $sh.CreateShortcut($lnk)
-      $sc.TargetPath       = $exe
-      $sc.Arguments        = '--daemon'
-      $sc.WorkingDirectory = (Split-Path $exe -Parent)
-      $sc.Description      = '微软壁纸助手 - 开机自动换壁纸'
-      $sc.IconLocation     = ('{0},0' -f $exe)
-      $sc.Save()
-      Write-Host '  已开启。下次登录后会在后台自动换壁纸, 一个窗口都不会闪。'
-      Write-Host ('  启动项位置: ' + $lnk)
-      Write-Host ('  指向: ' + $exe)
-      if ((Split-Path $exe -Leaf) -ne '微软壁纸助手.exe') {
-        Write-Host '  (这份 exe 名字里带版本号, 以后换新版本要重开一次本开关)' -ForegroundColor DarkYellow
-      }
-    } catch { Write-Host ('  开启失败: ' + $_.Exception.Message) }
+# 返回: create / update / ok / gone / off / fail
+#   gone = 以前建过, 现在没了 (被用户删了) —— 不再自动建
+function Ensure-BwDesktopShortcut {
+  $c = Get-BwConfig
+  if ([string]$c.desktop_shortcut -eq 'off') { return 'off' }
+  $want = Get-BwLauncherPath
+  if ((-not $want) -or (-not (Test-Path -LiteralPath $want))) { return 'fail' }
+  $sh = $null
+  try { $sh = New-Object -ComObject WScript.Shell } catch { return 'fail' }
+  $info = Get-BwDeskInfo
+
+  # 1) 记住的位置还在 -> 就地更新 (用户挪进文件夹也跟着走, 不在桌面根另建)
+  #    顺手补上"已经建过"的记号: 老版本留下的 desktop_shortcut.json 只有 path 没有
+  #    created, 不补的话以后这个快捷方式一旦被删, 会被当成"从来没建过"又在桌面根新建一个。
+  if ($info.path -and (Test-Path -LiteralPath $info.path)) {
+    if ([string]$info.created -ne 'yes') { $info.created = 'yes'; Save-BwDeskInfo $info }
+    return (Write-BwShortcut $sh $info.path $want)
   }
+
+  # 2) 记的位置没了 (被删/被挪) -> 桌面根和一层子目录里找, 找到了就接着用那个
+  $found = Find-BwDesktopLnk
+  if ($found) {
+    $info.path = $found
+    $info.created = 'yes'   # 找着了就说明确实建过, 别再当成"从来没建过"
+    Save-BwDeskInfo $info
+    return (Write-BwShortcut $sh $found $want)
+  }
+
+  # 3) 从来没自动建过 -> 建这一次
+  if ([string]$info.created -ne 'yes') {
+    $target = Join-Path (Get-BwDesktopDir) '微软壁纸助手.lnk'
+    $r = Write-BwShortcut $sh $target $want
+    if ($r -eq 'create') {
+      $info.path = $target
+      $info.created = 'yes'
+      Save-BwDeskInfo $info
+    }
+    return $r
+  }
+
+  # 4) 建过, 但被删了 -> 不再打扰
+  return 'gone'
+}
+function Test-BwAutoStart { return (Test-Path -LiteralPath (Get-BwStartupLnk)) }
+# 开机自动换做成**两个按钮**, 不是一个会翻面的开关。
+# 一个开关两面翻的问题是: 客户只看到「[A] 开机自动换壁纸 开/关」, 按下去到底是开还是关
+# 得先记住现在是什么状态; 记反了就正好按成自己不想要的那一下 —— 而且后台进程会立刻停,
+# 下次开机不换图, 他只会觉得"这软件不灵了"。
+# 所以菜单上只摆当前**能做**的那一个动作: 关着就只显示 [A] 打开, 开着就只显示 [B] 关闭。
+function Enable-BwAutoStart {
+  $lnk = Get-BwStartupLnk
+  $exe = Get-BwLauncherPath
+  if ((-not $exe) -or (-not (Test-Path -LiteralPath $exe))) {
+    Write-Host '  找不到主程序「微软壁纸助手.exe」。'
+    Write-Host '  请直接双击那个 exe 打开本菜单, 再来开这个开关。'
+    return $false
+  }
+  try {
+    # 清掉可能残留的 daemon.stop —— 不清的话刚拉起来的后台会立刻自己退掉
+    $sf = Join-Path $global:BWRoot 'daemon.stop'
+    if (Test-Path -LiteralPath $sf) { Remove-Item -LiteralPath $sf -Force -ErrorAction SilentlyContinue }
+    $sh = New-Object -ComObject WScript.Shell
+    $sc = $sh.CreateShortcut($lnk)
+    $sc.TargetPath       = $exe
+    $sc.Arguments        = '--daemon'
+    $sc.WorkingDirectory = (Split-Path $exe -Parent)
+    $sc.Description      = '微软壁纸助手 - 开机自动换壁纸'
+    $sc.IconLocation     = (Get-BwIconLocation $exe)
+    $sc.Save()
+    Write-Host '  已开启。下次登录后会在后台自动换壁纸, 一个窗口都不会闪。'
+    Write-Host ('  启动项位置: ' + $lnk)
+    Write-Host ('  指向: ' + $exe)
+    if ((Split-Path $exe -Leaf) -ne '微软壁纸助手.exe') {
+      Write-Host '  (这份 exe 名字里带版本号, 以后换新版本要重开一次本开关)' -ForegroundColor DarkYellow
+    }
+    return $true
+  } catch { Write-Host ('  开启失败: ' + $_.Exception.Message); return $false }
+}
+function Disable-BwAutoStart {
+  $lnk = Get-BwStartupLnk
+  if (-not (Test-Path -LiteralPath $lnk)) {
+    Write-Host '  开机自动换本来就是关着的, 不用关。'
+    return $false
+  }
+  try { Remove-Item -LiteralPath $lnk -Force } catch {}
+  # 告诉还在后台跑的 daemon 收工
+  try { Set-Content -LiteralPath (Join-Path $global:BWRoot 'daemon.stop') -Value 'stop' -Encoding ASCII } catch {}
+  Write-Host '  已关闭开机自动换壁纸。想再开, 回来按 [A] 就行。'
+  return $true
 }
 
 # ---------- [F] 收藏当前这张壁纸 ----------
@@ -832,7 +1003,9 @@ do {
   Write-Host ' —— 其他 ——'
   Write-Host '  [F] 收藏当前这张 / 取消收藏'
   Write-Host '  [S] 设置'
-  Write-Host '  [A] 开机自动换壁纸  开 / 关'
+  # 只摆当前能做那一下: 关着就只给「打开」, 开着就只给「关闭」
+  if (Test-BwAutoStart) { Write-Host '  [B] 关掉开机自动换壁纸   (现在: 开)' }
+  else { Write-Host '  [A] 打开开机自动换壁纸   (现在: 关)' }
   Write-Host '  [L] 查看运行日志'
   Write-Host '  [Q] 退出'
   $k = Normalize-BwKey (Read-Host '请选择')
@@ -850,7 +1023,8 @@ do {
     '8' { Show-Archive }
     'f' { Toggle-BwFavCurrent; Pause-Bw }
     's' { Show-BwSettings }
-    'a' { Toggle-BwAutoStart; Pause-Bw }
+    'a' { [void](Enable-BwAutoStart); Pause-Bw }
+    'b' { [void](Disable-BwAutoStart); Pause-Bw }
     'l' { Get-Content -LiteralPath $global:BWLog -Tail 40 -Encoding UTF8 -ErrorAction SilentlyContinue; Pause-Bw }
     # 退出: 主标识是 Q; 0 和 o 也认 —— 老菜单里那个 [0] 常被看成字母 O, 习惯不改
     'q' { $quit = $true }
