@@ -30,9 +30,10 @@ import shutil
 import subprocess
 import sys
 import time
+import datetime
 import ctypes
 
-VERSION = '1.3.0'
+VERSION = '1.4.0'
 APP_NAME = '微软壁纸助手'
 DATA_DIR_NAME = '微软壁纸助手数据'
 PAYLOAD_FILES = ['core.ps1', 'menu.ps1', '使用说明.txt', '微软壁纸助手.ico']
@@ -195,6 +196,23 @@ def read_interval(d):
         return 30
 
 
+def read_last_swap(d):
+    """上次真正换图的时刻, 读不到返回 None。
+
+    这是节拍的唯一依据: 菜单上「下次自动换」显示的就是 last_swap + 间隔,
+    core.ps1 判断该不该换也用它。daemon 必须跟着同一个数走, 否则
+    显示的时刻到了却不换 (最多错一整轮)。
+    """
+    try:
+        with open(os.path.join(d, 'state.json'), encoding='utf-8-sig') as f:
+            v = (json.load(f).get('last_swap') or '').strip()
+        if not v:
+            return None
+        return datetime.datetime.strptime(v, '%Y-%m-%d %H:%M:%S')
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------- 各模式
 def mode_menu(d):
     if not ensure_console():
@@ -213,18 +231,63 @@ def mode_daemon(d):
             os.remove(stop_file)
         except Exception:
             pass
+
+    # 节拍跟着「上次换图时刻」走, 不跟着本进程的启动时刻走。
+    # 老写法是"跑一轮 -> 睡满 30 分钟 -> 再跑一轮", 于是:
+    #   手动换一张 -> last_swap 前移 -> 菜单显示的下次时间前移,
+    #   但 daemon 还在按老节拍睡, 醒来一算没到点就又睡一整轮,
+    #   表现就是"菜单说的时间到了却不换"。
+    CHECK_S = 30    # 多久看一眼 state.json: 感知手动换图 / 停止信号
+    LEAD_S = 2      # 到点后多等 2 秒, 避开 core.ps1 那边"差一点点没到"的边界
+
+    prev = read_last_swap(d)
+    hold_until = 0.0     # 这轮没换成图时的兜底: 至少等到这个时刻, 免得空转
     while True:
-        run_cycle(d)
+        if os.path.isfile(stop_file):
+            try:
+                os.remove(stop_file)
+            except Exception:
+                pass
+            return 0
+
         gap = read_interval(d)
-        slice_s = 15
-        for _ in range(max(1, int(gap * 60 / slice_s))):
-            time.sleep(slice_s)
+        ls = read_last_swap(d)
+        if ls is not None and (prev is None or ls != prev):
+            # 换过图了 (自己换的、菜单里手动换的、重启换的都算) -> 从这一刻重新计时
+            hold_until = 0.0
+            prev = ls
+        target = 0.0 if ls is None else max(ls.timestamp() + gap * 60, hold_until)
+
+        # 分片睡到目标时刻; 中途每 CHECK_S 秒醒一次看有没有变化
+        due = False
+        while True:
+            left = target + LEAD_S - time.time()
+            if left <= 0:
+                due = True
+                break
+            time.sleep(min(CHECK_S, left))
             if os.path.isfile(stop_file):
                 try:
                     os.remove(stop_file)
                 except Exception:
                     pass
                 return 0
+            if read_last_swap(d) != prev:
+                # 有人换过图了 (多半是用户在菜单里按了 [1]):
+                # 这时候**不能**跟着换一张 —— 那会把人家刚挑的图顶掉。
+                # 什么都不做, 回到外层按新的换图时刻重新算。
+                break
+
+        if not due:
+            continue
+
+        run_cycle(d)
+        after = read_last_swap(d)
+        if after is None or after == ls:
+            # 这轮没换成 (网络不通 / 库是空的 / 必应还没发新图):
+            # 不空转, 隔一整轮再试
+            hold_until = time.time() + gap * 60
+        prev = after
 
 
 def mode_once(d):

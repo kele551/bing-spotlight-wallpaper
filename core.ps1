@@ -1,4 +1,4 @@
-﻿# 微软壁纸助手 - 核心库 (by 海风 & Cindy)
+# 微软壁纸助手 - 核心库 (by 海风 & Cindy)
 param([switch]$Update, [switch]$Cycle, [switch]$DryRun)
 $global:BWRoot = $PSScriptRoot
 $global:CfgPath = Join-Path $global:BWRoot 'config.json'
@@ -287,6 +287,11 @@ function Get-BwConfig {
   if (-not $c.resolution_mode) { Add-Member -InputObject $c NoteProperty resolution_mode 'uhd' -Force }
   if (-not $c.spotlight_per_cycle) { Add-Member -InputObject $c NoteProperty spotlight_per_cycle 6 -Force }
   if (-not $c.cycle_minutes) { Add-Member -InputObject $c NoteProperty cycle_minutes 30 -Force }
+  # 壁纸填充方式。默认 fill(填充) —— 与 v1.3.0 及更早的行为一致, 老用户升级后桌面不会变样。
+  if (-not $c.wallpaper_style) { Add-Member -InputObject $c NoteProperty wallpaper_style 'fill' -Force }
+  # 只在收藏里轮换。默认关。
+  if (-not $c.fav_only) { Add-Member -InputObject $c NoteProperty fav_only $false -Force }
+  if (-not $c.PSObject.Properties['desktop_shortcut']) { Add-Member -InputObject $c NoteProperty desktop_shortcut 'on' -Force }
   return $c
 }
 function Save-BwConfig([psobject]$c) {
@@ -305,17 +310,22 @@ function Get-BwState {
   if ($s) { try { $ver = [int]$s.schema } catch { $ver = 0 } }
   if ($ver -lt 3) {
     # 3 以前的结构不一样, 没法迁, 重置
-    if ($existed) { Log ('节奏进度文件版本 ' + $ver + ' -> 4, 结构变了, 已重置 (下一次运行会重新切一次必应当日图)') }
+    if ($existed) { Log ('节奏进度文件版本 ' + $ver + ' -> 5, 结构变了, 已重置 (下一次运行会重新切一次必应当日图)') }
     $s = New-Object PSObject
   } elseif ($ver -eq 3) {
     # 3 -> 4 只是多了两个字段, 原有的换图进度全部保留
     Log '节奏进度文件 3 -> 4: 保留原有进度, 新增必应水位线'
+  } elseif ($ver -eq 4) {
+    # 4 -> 5 多了收藏名单, 换图进度、队列、水位线一律保留
+    Log '节奏进度文件 4 -> 5: 保留原有进度, 新增收藏名单'
   }
   # bing_high_date : 必应补漏的水位线, 只往前不后退 (详见 Get-BwHighDate)
+  # favorites      : 收藏的图片文件名, 只记名字 (和 queue 一个口径); 图被删掉也
+  #                  留着, 取用时自然剔除, 不必提前清理 —— 万一手滑删了还能加回来。
   $def = [ordered]@{
-    schema = 4; last_bing_date = ''; last_swap = ''; last_boot = ''
+    schema = 5; last_bing_date = ''; last_swap = ''; last_boot = ''
     queue = @(); refills = 0; shown = 0; last_wall = ''
-    bing_high_date = ''
+    bing_high_date = ''; favorites = @()
   }
   foreach ($k in $def.Keys) {
     $p = $s.PSObject.Properties[$k]
@@ -323,7 +333,7 @@ function Get-BwState {
   }
   # schema 要**强制**写成当前版本: 上面那个循环只在"字段缺失或为空"时才补,
   # 而 schema 永远是 3 (有值), 于是升完级还是 3, 每次进来都要再"升级"一遍。
-  Add-Member -InputObject $s NoteProperty schema 4 -Force
+  Add-Member -InputObject $s NoteProperty schema 5 -Force
   return $s
 }
 function Save-BwState($s) {
@@ -358,11 +368,67 @@ function Get-BwSpotlightWant {
   return 6
 }
 # 把库里所有图洗一次牌。"不重复"由此天然成立, 不必另存一份"已看过"名单。
-function Get-BwFreshQueue {
+# 开了「只看收藏」就只洗收藏里那几张; 收藏里一张都用不了(还没收藏、或全被删了)时
+# 退回洗整个库 —— 不然会卡在"挑不出图"上, 永远不换壁纸。
+function Get-BwFreshQueue($s) {
+  $c = Get-BwConfig
   $names = @()
-  foreach ($f in @(Get-BwSpotlightAll)) { $names += [string]$f.Name }
+  if ([bool]$c.fav_only) {
+    foreach ($f in @(Get-BwFavFiles $s)) { $names += [string]$f.Name }
+    if ($names.Count -eq 0) {
+      Log '只看收藏: 收藏里没有能用的图, 这一轮先从整个库里挑'
+      foreach ($f in @(Get-BwSpotlightAll)) { $names += [string]$f.Name }
+    }
+  } else {
+    foreach ($f in @(Get-BwSpotlightAll)) { $names += [string]$f.Name }
+  }
   if ($names.Count -eq 0) { return @() }
   return @($names | Sort-Object { Get-Random })
+}
+
+# ---- 收藏 ----
+# 名单存在 state.json 里(和 queue 一个口径, 只记文件名), 不在壁纸目录写 sidecar ——
+# 那样用户整理图片时会看到一堆额外的小文件, 平白把壁纸文件夹弄脏。
+# 图被删掉或挪走后, 收藏项会指向不存在的图; 取用时剔除就行, 不提前清理
+# (万一手滑删了, 把图拷回来收藏还在)。
+function Get-BwFav($s) {
+  if (-not $s) { return @() }
+  return @(@($s.favorites | Where-Object { $_ }) | ForEach-Object { [string]$_ })
+}
+function Test-BwFav($s, [string]$name) {
+  if (-not $name) { return $false }
+  $n = [string]$name
+  foreach ($f in (Get-BwFav $s)) { if ($f -eq $n) { return $true } }
+  return $false
+}
+# 返回是否真的新增了 —— 已经收藏过的返回 False, 不重复记, 也不重复提示。
+function Add-BwFav($s, [string]$name) {
+  if (-not $name) { return $false }
+  $n = [string]$name
+  if (Test-BwFav $s $n) { return $false }
+  # 必须写成 @(Get-BwFav $s) + @($n), 两边都是数组。
+  # 单元素数组从函数返回时会被**展开成标量字符串**, 这时 `字符串 + 数组` 走的是
+  # 字符串拼接而不是数组连接 —— 结果是收藏第二张时两个文件名首尾相连变成一条,
+  # 收藏夹里就只剩一个拼坏的名字, 两张都不生效 (实测: 加第 2 张后 favcount 仍是 1)。
+  $s.favorites = @(@(Get-BwFav $s) + @($n))
+  return $true
+}
+function Remove-BwFav($s, [string]$name) {
+  if (-not $name) { return $false }
+  $n = [string]$name
+  $before = @(Get-BwFav $s).Count
+  $s.favorites = @(@(Get-BwFav $s) | Where-Object { $_ -ne $n })
+  return (@(@($s.favorites)).Count -lt $before)
+}
+# 收藏里**现在还在库里**的文件 (必应、聚焦两个库都算)。不在库里的直接跳过。
+function Get-BwFavFiles($s) {
+  $want = @{}
+  foreach ($n in (Get-BwFav $s)) { $want[$n] = $true }
+  if ($want.Count -eq 0) { return @() }
+  $out = @()
+  foreach ($f in @(Get-BwSpotlightAll)) { if ($want.ContainsKey([string]$f.Name)) { $out += $f } }
+  foreach ($f in @(Get-BwBingAll))      { if ($want.ContainsKey([string]$f.Name)) { $out += $f } }
+  return @($out)
 }
 # 队列里存的是文件名, 而图随时可能被用户自己删掉或挪到别处 —— 这是完全正常的操作,
 # 不是故障。所以每次取图之前先把"已经不在库里"的名字一次性剔掉, 而不是等轮到它
@@ -375,6 +441,9 @@ function Sync-BwQueue($s) {
   if (-not (Test-Path -LiteralPath $dir)) { return 0 }
   $live = @{}
   foreach ($f in @(Get-BwSpotlightAll)) { $live[[string]$f.Name] = $true }
+  # 开了「只看收藏」时队列里会混进必应库的图, 把它们也算作"还在",
+  # 否则这些图会在每次取图前被当成"已被删掉"剔得一干二净。
+  if ([bool]$c.fav_only) { foreach ($f in @(Get-BwBingAll)) { $live[[string]$f.Name] = $true } }
   $before = @($s.queue | Where-Object { $_ }).Count
   if ($before -eq 0) { return 0 }
   $s.queue = @($s.queue | Where-Object { $_ -and $live.ContainsKey([string]$_) })
@@ -394,6 +463,8 @@ function Get-BwNextWall($s) {
       $name = [string]$q[0]
       $q = @($q | Select-Object -Skip 1)
       $p = Join-Path $c.spotlight_save_dir $name
+      # 收藏里可能有必应库的图, 聚焦目录里找不到就再去必应目录找一次
+      if (-not (Test-Path -LiteralPath $p)) { $p = Join-Path $c.bing_save_dir $name }
       if (Test-Path -LiteralPath $p) { $s.queue = $q; return (Get-Item -LiteralPath $p) }
       # 这张被删了, 丢掉接着取下一张
     }
@@ -447,18 +518,41 @@ function Get-BwName($meta) {
   $n = ('{0}_{1}_{2}.jpg' -f (Get-BwDisplayDate $meta), $meta.title, $titlePart)
   return ($n -replace '[\\/:*?\"<>| ]','')
 }
+# 屏幕**物理**像素。
+# Screen::PrimaryScreen.Bounds 给的是逻辑像素: 4K 屏开 150% 缩放时它只报 2560x1440,
+# 拿去判断"要不要下 4K 图"就会挑成 1080p —— 图存下来是缩水的, 还看不出为什么。
+# 乘上系统 DPI 还原成物理像素; 拿不到 DPI(老系统)就按 96(100%) 走, 与旧行为一致。
+function Get-BwScreenPhysical {
+  try {
+    Add-Type -AssemblyName System.Windows.Forms
+    $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+    $dpi = 96
+    if (-not ('BwDpi' -as [type])) {
+      Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class BwDpi { [DllImport("user32.dll")] public static extern uint GetDpiForSystem(); }'
+    }
+    try { $d = [int][BwDpi]::GetDpiForSystem(); if ($d -gt 0) { $dpi = $d } } catch {}
+    return @([int]($b.Width * $dpi / 96), [int]($b.Height * $dpi / 96))
+  } catch { return @(0, 0) }
+}
 function Get-BwCandidates($meta, $mode) {
   $ub = "https://cn.bing.com$($meta.urlbase)"
   $suf = @()
   if ($mode -eq 'auto') {
-    try {
-      Add-Type -AssemblyName System.Windows.Forms
-      $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-      if ($b.Width -ge 3840) { $suf += '_UHD' }
-      elseif ($b.Height -ge 1200) { $suf += '_1920x1200'; $suf += '_UHD' }
-      elseif ($b.Width -ge 1920) { $suf += '_1920x1080'; $suf += '_1920x1200'; $suf += '_UHD' }
-      else { $suf += '_1366x768'; $suf += '_1920x1080'; $suf += '_UHD' }
-    } catch { $suf = @('_UHD') }
+    $w = 0; $h = 0
+    $ph = @(Get-BwScreenPhysical)
+    if ($ph.Count -ge 2) { $w = [int]$ph[0]; $h = [int]$ph[1] }
+    if ($w -le 0) {
+      # DPI 那条路走不通, 退回逻辑像素, 至少还能挑个大概
+      try {
+        Add-Type -AssemblyName System.Windows.Forms
+        $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+        $w = $b.Width; $h = $b.Height
+      } catch {}
+    }
+    if ($w -ge 3840) { $suf += '_UHD' }
+    elseif ($h -ge 1200) { $suf += '_1920x1200'; $suf += '_UHD' }
+    elseif ($w -ge 1920) { $suf += '_1920x1080'; $suf += '_1920x1200'; $suf += '_UHD' }
+    else { $suf += '_1366x768'; $suf += '_1920x1080'; $suf += '_UHD' }
   } else { $suf = @('_UHD') }
   $suf += '_1920x1080'
   $urls = @($suf | Select-Object -Unique | ForEach-Object { "$ub$_.jpg" })
@@ -469,13 +563,48 @@ function Get-BwTargetPath([string]$date, [string]$name) {
   $c = Get-BwConfig
   return (Join-Path $c.bing_save_dir $name)
 }
+# 壁纸填充方式。注册表两个值配合: WallpaperStyle + TileWallpaper。
+#   fill 填充 10/0   保持比例铺满, 多出来的裁掉 (v1.3.0 及更早的写死值, 保持默认不动)
+#   fit 适应   6/0   保持比例完整显示, 两边留黑边
+#   stretch 拉伸 2/0 拉满屏幕, 比例会变形
+#   center 居中 0/0  原尺寸居中
+#   tile 平铺  0/1   原尺寸铺满
+#   span 跨区  22/0  多显示器横跨 (单屏效果同填充)
+# 以前这里硬写 10 —— 用户自己在系统设置里选的"适应"会被每次换图覆盖回去。
+# 那是用户的设置, 程序不该反复改它; 现在按 config 走, 且只在值不同时才写。
+function Get-BwWallStyle {
+  $c = Get-BwConfig
+  $k = 'fill'
+  if ($c.wallpaper_style) { $k = ([string]$c.wallpaper_style).ToLower() }
+  switch ($k) {
+    'fit'     { return @{ Style = '6';  Tile = '0'; Label = '适应' } }
+    'stretch' { return @{ Style = '2';  Tile = '0'; Label = '拉伸' } }
+    'center'  { return @{ Style = '0';  Tile = '0'; Label = '居中' } }
+    'tile'    { return @{ Style = '0';  Tile = '1'; Label = '平铺' } }
+    'span'    { return @{ Style = '22'; Tile = '0'; Label = '跨区' } }
+    default   { return @{ Style = '10'; Tile = '0'; Label = '填充' } }
+  }
+}
 function Set-BwDesktopWallpaper([string]$path) {
   if (-not ('WinWall' -as [type])) {
     Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class WinWall { [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern bool SystemParametersInfo(uint a, uint p, string v, uint f); }'
   }
-  Set-ItemProperty 'HKCU:\Control Panel\Desktop' -Name WallpaperStyle -Value 10
-  Set-ItemProperty 'HKCU:\Control Panel\Desktop' -Name TileWallpaper -Value 0
+  $w = Get-BwWallStyle
+  $k = 'HKCU:\Control Panel\Desktop'
+  $cur = Get-ItemProperty $k -ErrorAction SilentlyContinue
+  if ([string]$cur.WallpaperStyle -ne $w.Style) { Set-ItemProperty $k -Name WallpaperStyle -Value $w.Style }
+  if ([string]$cur.TileWallpaper -ne $w.Tile)   { Set-ItemProperty $k -Name TileWallpaper -Value $w.Tile }
   return [WinWall]::SystemParametersInfo(0x0014, 0, $path, 3)
+}
+# 只改填充方式、不换图时, 得把当前这张再设一次才能立刻看到效果。
+# 返回是否成功; 当前壁纸不存在就返回 False。
+function Apply-BwWallStyle {
+  $cur = (Get-ItemProperty 'HKCU:\Control Panel\Desktop' -ErrorAction SilentlyContinue).Wallpaper
+  if (-not $cur) { return $false }
+  if (-not (Test-Path -LiteralPath $cur)) { return $false }
+  $w = Get-BwWallStyle
+  Log ('填充方式改为 ' + $w.Label + ', 重设当前壁纸使其立刻生效')
+  return [bool](Set-BwDesktopWallpaper $cur)
 }
 function Save-BwFile([string[]]$urls, [string]$path) {
   foreach ($u in $urls) {

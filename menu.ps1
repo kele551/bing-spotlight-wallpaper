@@ -1,7 +1,7 @@
-﻿# 微软壁纸助手 - 菜单 (by 海风 & 小腾)
+# 微软壁纸助手 - 菜单 (by 海风 & 小腾)
 . (Join-Path $PSScriptRoot 'core.ps1')
 
-$global:BWVersion = '1.3.0'
+$global:BWVersion = '1.4.0'
 
 # 把用户按键归一化: 去首尾空格 + 全角转半角 + 转小写。
 # 中文输入法很容易把 o 打成全角 ｏ, 不归一化就变成"按了键没反应"。
@@ -212,6 +212,7 @@ function Set-BwBase([string]$base) {
 # ---------- [4] 从库里挑一张 ----------
 function Show-BrowseAll {
   $c = Get-BwConfig
+  $s = Get-BwState
   $files = @()
   foreach ($pair in @(@('必应', $c.bing_save_dir), @('聚焦', $c.spotlight_save_dir))) {
     $files += @(Get-ChildItem -LiteralPath $pair[1] -File -Filter *.jpg -ErrorAction SilentlyContinue |
@@ -224,16 +225,39 @@ function Show-BrowseAll {
     Write-Host '  菜单 [1] 会顺手抓图, [7] 补必应, 开着自动换也会自己攒起来。'
     return
   }
-  Write-Host ('  —— 壁纸库 (最近 ' + $files.Count + ' 张, [必应]/[聚焦] 标来源) ——')
+  Write-Host ('  —— 壁纸库 (最近 ' + $files.Count + ' 张, [必应]/[聚焦] 标来源, ★ = 已收藏) ——')
   Write-Host ('  所在文件夹: ' + $c.bing_save_dir)
   $i = 0
-  foreach ($f in $files) { Write-Host ("  [$i] [$($f.src)] $($f.file.Name)"); $i++ }
+  foreach ($f in $files) {
+    $star = '  '
+    if (Test-BwFav $s ([string]$f.file.Name)) { $star = '★ ' }
+    Write-Host ("  [$i] $star[$($f.src)] $($f.file.Name)")
+    $i++
+  }
   Write-Host '  [o] 打开文件夹    [q] 返回'
+  Write-Host '  f+序号 = 收藏 / 取消收藏 (如 f3)'
   $sel = Normalize-BwKey (Read-Host '  输入序号设为壁纸')
   if ($sel -eq '' -or $sel -eq 'q') { return }
   if ($sel -eq 'o') {
     Open-BwDir $c.bing_save_dir
     Open-BwDir $c.spotlight_save_dir
+    return
+  }
+  if ($sel -match '^f(\d+)$') {
+    $idx = [int]$Matches[1]
+    if (($idx -ge 0) -and ($idx -lt $files.Count)) {
+      $nm = [string]$files[$idx].file.Name
+      if (Add-BwFav $s $nm) {
+        Save-BwState $s
+        Write-Host ('  已收藏 ★ ' + $nm)
+        Log ('收藏: ' + $nm)
+      } else {
+        [void](Remove-BwFav $s $nm)
+        Save-BwState $s
+        Write-Host ('  已取消收藏 ' + $nm)
+        Log ('取消收藏: ' + $nm)
+      }
+    } else { Write-Host '  没有这一项' }
     return
   }
   try {
@@ -302,6 +326,91 @@ function Invoke-BwBackfillManual {
   Write-Host '  删掉或移走的旧图不会被补回来 —— 补的只是真正错过的那些天。'
 }
 
+# ---------- 收藏夹 ----------
+# 收藏是个"白名单": 加进来容易, 退出来也容易, 一个图片文件都不动。
+# 收藏的图被删掉之后, 名单里的名字会留着 —— 取用时自然跳过, 不提前清理
+# (万一手滑删了图, 拷回来收藏还在)。
+# 这里用 if/elseif 而不是 switch: PowerShell 的 switch 会把匹配到的子句**全部执行**,
+# 而 '1' 同时能匹配纯数字和别的形式, 容易按下一次做两件事 (v1.2.1 修过同类问题)。
+function Show-BwFavorites {
+  $back = $false
+  do {
+    Clear-Host
+    $c = Get-BwConfig
+    $s = Get-BwState
+    $files = @(Get-BwFavFiles $s)
+    $allN = @(Get-BwFav $s).Count
+    Write-Host '========== 收藏夹 ==========' -ForegroundColor Cyan
+    Write-Host ''
+    $onoff = '关 (从整个库里轮换)'
+    if ([bool]$c.fav_only) { $onoff = '开 (只换收藏里的)' }
+    Write-Host ('  [s] 只在收藏里轮换    ' + $onoff)
+    Write-Host ''
+    if ($files.Count -eq 0) {
+      Write-Host '  还没有收藏。'
+      Write-Host '  主菜单按 [F] 收藏当前这张; 或在 [4] 从库里挑一张里, 输入 f+序号 (如 f3) 收藏。'
+    } else {
+      Write-Host ('  —— 收藏 ' + $files.Count + ' 张 ——')
+      $bb = ([string]$c.bing_save_dir).TrimEnd('\')
+      $i = 0
+      foreach ($f in $files) {
+        $mark = '聚焦'
+        $db = ''
+        try { $db = ([string]$f.DirectoryName).TrimEnd('\') } catch {}
+        if ($db -and ($db -eq $bb)) { $mark = '必应' }
+        Write-Host ("  [$i] [$mark] $($f.Name)")
+        $i++
+      }
+      if ($allN -gt $files.Count) {
+        Write-Host ('  (另有 ' + ($allN - $files.Count) + ' 张收藏的图已经不在库里了)') -ForegroundColor DarkGray
+      }
+      Write-Host ''
+      Write-Host '  数字 = 设为壁纸    r+数字 = 移出收藏 (如 r3)'
+    }
+    Write-Host '  [q] 返回'
+    Write-Host ''
+    $k = Normalize-BwKey (Read-Host '  操作')
+    if ($k -eq 'q') { $back = $true }
+    elseif ($k -eq 's') {
+      $c = Get-BwConfig
+      $c.fav_only = -not ([bool]$c.fav_only)
+      Save-BwConfig $c
+      # 队列是按旧模式洗好的, 切完开关立刻重洗一次
+      $s = Get-BwState
+      $s.queue = @(Get-BwFreshQueue $s)
+      Save-BwState $s
+      if ([bool]$c.fav_only) {
+        $n = @(Get-BwFavFiles $s).Count
+        if ($n -eq 0) {
+          Write-Host '  已开启。但收藏里还没有图 —— 暂时先从整个库里挑, 收藏几张之后就只换收藏的了。' -ForegroundColor Yellow
+        } else {
+          Write-Host ('  已开启: 只在收藏的 ' + $n + ' 张里轮换。') -ForegroundColor Green
+        }
+      } else { Write-Host '  已关闭: 从整个库里轮换。' }
+      Log ('设置: 只在收藏里轮换 -> ' + [bool]$c.fav_only)
+      Pause-Bw
+    }
+    elseif ($k -match '^r(\d+)$') {
+      $idx = [int]$Matches[1]
+      if (($idx -ge 0) -and ($idx -lt $files.Count)) {
+        $nm = [string]$files[$idx].Name
+        if (Remove-BwFav $s $nm) { Save-BwState $s; Write-Host ('  已移出收藏: ' + $nm) }
+      } else { Write-Host '  没有这一项' }
+      Pause-Bw
+    }
+    elseif ($k -match '^(\d+)$') {
+      $idx = [int]$Matches[1]
+      if (($idx -ge 0) -and ($idx -lt $files.Count)) {
+        $p = $files[$idx].FullName
+        $ok = Set-BwDesktopWallpaper $p
+        Write-Host ('  已设为壁纸 (ok=' + $ok + '): ' + (Split-Path $p -Leaf))
+        Log ('收藏夹设壁纸: ' + $p)
+      } else { Write-Host '  没有这一项' }
+      Pause-Bw
+    }
+  } while (-not $back)
+}
+
 # ---------- 设置 ----------
 function Show-BwSettings {
   $back = $false
@@ -318,6 +427,14 @@ function Show-BwSettings {
       Write-Host ('  [3] 壁纸保存位置    必应: ' + $c.bing_save_dir)
       Write-Host ('                      聚焦: ' + $c.spotlight_save_dir)
     }
+    $favN = @(Get-BwFavFiles (Get-BwState)).Count
+    $favOnly = '关'
+    if ([bool]$c.fav_only) { $favOnly = '开' }
+    Write-Host ('  [4] 壁纸填充方式    ' + (Get-BwWallStyle).Label)
+    Write-Host ('  [5] 收藏夹          ' + $favN + ' 张 · 只在收藏里轮换 ' + $favOnly)
+    $deskOn = '开'
+    if ([string]$c.desktop_shortcut -eq 'off') { $deskOn = '关' }
+    Write-Host ('  [6] 桌面快捷方式    ' + $deskOn)
     Write-Host ''
     Write-Host '  [q] 返回'
     Write-Host ''
@@ -358,6 +475,56 @@ function Show-BwSettings {
         $sel = Select-BwBase '' ''
         if (-not $sel) { Write-Host '  没改。' }
         else { [void](Set-BwBase $sel) }
+        Pause-Bw
+      }
+      '4' {
+        Clear-Host
+        Write-Host '========== 壁纸填充方式 ==========' -ForegroundColor Cyan
+        Write-Host ''
+        Write-Host ('  现在: ' + (Get-BwWallStyle).Label)
+        Write-Host ''
+        Write-Host '   [1] 填充   铺满屏幕, 按比例放大后多出来的裁掉 (默认)'
+        Write-Host '   [2] 适应   整张完整显示, 不够的地方留黑边'
+        Write-Host '   [3] 拉伸   拉满屏幕, 比例会变形'
+        Write-Host '   [4] 居中   原尺寸放中间'
+        Write-Host '   [5] 平铺   原尺寸反复铺满'
+        Write-Host '   [6] 跨区   多显示器横跨 (单屏效果同填充)'
+        Write-Host ''
+        Write-Host '  [q] 返回'
+        Write-Host ''
+        $k2 = Normalize-BwKey (Read-Host '  选哪个')
+        $map = @{ '1' = 'fill'; '2' = 'fit'; '3' = 'stretch'; '4' = 'center'; '5' = 'tile'; '6' = 'span' }
+        if ($map.ContainsKey($k2)) {
+          $c2 = Get-BwConfig
+          $c2.wallpaper_style = $map[$k2]
+          Save-BwConfig $c2
+          $null = Apply-BwWallStyle
+          Write-Host ('  好了: ' + (Get-BwWallStyle).Label + ' —— 已立刻应用到当前这张壁纸。')
+          Log ('设置: 填充方式改为 ' + $map[$k2])
+        }
+        Pause-Bw
+      }
+      '5' { Show-BwFavorites }
+      '6' {
+        $c2 = Get-BwConfig
+        if ([string]$c2.desktop_shortcut -eq 'off') {
+          $c2.desktop_shortcut = 'on'
+          Save-BwConfig $c2
+          $r = Ensure-BwDesktopShortcut
+          if ($r -eq 'create' -or $r -eq 'update') {
+            Write-Host ('  已创建: ' + (Get-BwDesktopLnk))
+          } elseif ($r -eq 'ok') {
+            Write-Host '  桌面上已经有了, 不用动。'
+          } else {
+            Write-Host '  没建成 —— 找不到主程序或桌面不让写。'
+          }
+        } else {
+          $c2.desktop_shortcut = 'off'
+          Save-BwConfig $c2
+          $lnk = Get-BwDesktopLnk
+          if (Test-Path -LiteralPath $lnk) { Remove-Item -LiteralPath $lnk -Force -ErrorAction SilentlyContinue }
+          Write-Host '  已关掉, 桌面上的快捷方式也删了。以后不会再自动建。'
+        }
         Pause-Bw
       }
       'q' { $back = $true }
@@ -418,6 +585,11 @@ function Invoke-BwFirstRun {
 
   Write-Host ''
   Write-Host ('  好了。壁纸保存在: ' + $base) -ForegroundColor Green
+  # 第一次就把桌面快捷方式建好, 以后不用用户再动手
+  $desk = Ensure-BwDesktopShortcut
+  if ($desk -eq 'create') {
+    Write-Host '  桌面上已经放了一个「微软壁纸助手」快捷方式, 以后双击它就能打开这里。' -ForegroundColor Green
+  }
   Write-Host ''
   Write-Host '  想让它在后台自动换, 回到菜单按 [A] 打开「开机自动换壁纸」,'
   Write-Host '  不需要管理员权限, 也不装计划任务; 再按一次 [A] 就关掉。'
@@ -430,10 +602,108 @@ function Invoke-BwFirstRun {
 function Get-BwStartupLnk {
   return (Join-Path ([Environment]::GetFolderPath('Startup')) '微软壁纸助手.lnk')
 }
+# 快捷方式要指向**固定名**那份 exe (微软壁纸助手.exe), 而不是 微软壁纸助手-v1.4.0.exe。
+# 指到带版本号的名字上, 下一次升级换了文件名, 开机自动换就无声失效了 ——
+# 用户不打开菜单根本看不出来 (v1.3.0 就是这么断的: CHANGELOG 说了要用固定名,
+# 但部署时只拷了带版本号的那份, 于是建快捷方式时直接用了当前 exe 路径)。
+# 所以: 固定名存在就用它; 不存在就自己复制一份出来, 再不行才退回当前 exe。
+function Get-BwFixedExe {
+  $cur = ''
+  $p = Join-Path $global:BWRoot 'launcher.txt'
+  if (Test-Path -LiteralPath $p) { $cur = (Get-Content -LiteralPath $p -Raw -Encoding UTF8).Trim() }
+  if (-not $cur) { return '' }
+  if (-not (Test-Path -LiteralPath $cur)) { return '' }
+  return (Join-Path (Split-Path $cur -Parent) '微软壁纸助手.exe')
+}
+function Ensure-BwFixedExe {
+  $fixed = Get-BwFixedExe
+  if (-not $fixed) { return '' }
+  if (Test-Path -LiteralPath $fixed) { return $fixed }
+  # 固定名那份还没拷过来 —— 从当前 exe 复制一份, 内容一模一样。
+  # 只在本程序自己所在目录里操作, 不碰系统, 复制失败也无所谓(下面会退回当前 exe)。
+  $cur = (Get-Content -LiteralPath (Join-Path $global:BWRoot 'launcher.txt') -Raw -Encoding UTF8).Trim()
+  try { Copy-Item -LiteralPath $cur -Destination $fixed -Force; return $fixed } catch { return '' }
+}
 function Get-BwLauncherPath {
+  $fixed = Ensure-BwFixedExe
+  if ($fixed -and (Test-Path -LiteralPath $fixed)) { return $fixed }
   $p = Join-Path $global:BWRoot 'launcher.txt'
   if (Test-Path -LiteralPath $p) { return (Get-Content -LiteralPath $p -Raw -Encoding UTF8).Trim() }
   return ''
+}
+# exe 换个地方放之后, 启动文件夹里的快捷方式还指着老位置 ——
+# 菜单上却照样显示"开", 用户根本看不出来开机后其实什么都没拉起来。
+# 所以每次进菜单都核对一下, 指错了就重新指到当前这份 exe。
+# 顺带把老版本"指向带版本号文件名"的快捷方式也修正成固定名。
+function Repair-BwAutoStart {
+  $lnk = Get-BwStartupLnk
+  if (-not (Test-Path -LiteralPath $lnk)) { return $false }
+  $want = Get-BwLauncherPath
+  if ((-not $want) -or (-not (Test-Path -LiteralPath $want))) { return $false }
+  $sh = $null
+  $cur = ''
+  try {
+    $sh = New-Object -ComObject WScript.Shell
+    $cur = $sh.CreateShortcut($lnk).TargetPath
+  } catch { return $false }
+  if ($cur -and (Test-Path -LiteralPath $cur) -and ($cur -eq $want)) { return $false }
+  try {
+    $sc = $sh.CreateShortcut($lnk)
+    $sc.TargetPath       = $want
+    $sc.Arguments        = '--daemon'
+    $sc.WorkingDirectory = (Split-Path $want -Parent)
+    $sc.Description      = '微软壁纸助手 - 开机自动换壁纸'
+    $sc.IconLocation     = ('{0},0' -f $want)
+    $sc.Save()
+    Log ('开机自动换: 快捷方式原先指向 [' + $cur + '], 已改指 [' + $want + ']')
+    return $true
+  } catch { return $false }
+}
+# ---------- 桌面快捷方式 ----------
+# 桌面上要一直有一个能双击打开菜单的快捷方式, 不用用户自己动手建:
+#   · 没有 -> 建一个 (首次运行就会有)
+#   · exe 换了地方 -> 改指过去 (挪到哪个盘都跟着)
+#   · exe 被新版本覆盖过 (文件比快捷方式新) -> 重写一遍, 顺带把图标刷新成新版的
+# 在设置 [6] 里关掉之后就完全不动, 也不再自动建。
+function Get-BwDesktopLnk {
+  return (Join-Path ([Environment]::GetFolderPath('Desktop')) '微软壁纸助手.lnk')
+}
+# 返回: create / update / ok / off / fail
+function Ensure-BwDesktopShortcut {
+  $c = Get-BwConfig
+  if ([string]$c.desktop_shortcut -eq 'off') { return 'off' }
+  $want = Get-BwLauncherPath
+  if ((-not $want) -or (-not (Test-Path -LiteralPath $want))) { return 'fail' }
+  $lnk = Get-BwDesktopLnk
+  $sh = $null
+  try { $sh = New-Object -ComObject WScript.Shell } catch { return 'fail' }
+  $need = 'create'
+  if (Test-Path -LiteralPath $lnk) {
+    $need = ''
+    $cur = ''
+    try { $cur = [string]$sh.CreateShortcut($lnk).TargetPath } catch { return 'fail' }
+    if ($cur -ne $want) {
+      $need = 'update'      # 指错地方了 (挪过/换过版本)
+    } else {
+      # 指向没变, 但 exe 文件本身更新过 -> 重存一次, 让桌面图标跟着新版刷新
+      $tw = (Get-Item -LiteralPath $want).LastWriteTime
+      $tl = (Get-Item -LiteralPath $lnk).LastWriteTime
+      if ($tw -gt $tl) { $need = 'update' }
+    }
+  }
+  if (-not $need) { return 'ok' }
+  try {
+    $sc = $sh.CreateShortcut($lnk)
+    $sc.TargetPath       = $want
+    $sc.Arguments        = ''
+    $sc.WorkingDirectory = (Split-Path $want -Parent)
+    $sc.Description      = '微软壁纸助手 - 双击打开菜单'
+    $sc.IconLocation     = ('{0},0' -f $want)
+    $sc.Save()
+    if ($need -eq 'create') { Log ('桌面快捷方式: 已创建 -> ' + $lnk) }
+    else { Log ('桌面快捷方式: 已更新, 指向 [' + $want + ']') }
+    return $need
+  } catch { return 'fail' }
 }
 function Test-BwAutoStart { return (Test-Path -LiteralPath (Get-BwStartupLnk)) }
 function Toggle-BwAutoStart {
@@ -464,8 +734,36 @@ function Toggle-BwAutoStart {
       $sc.Save()
       Write-Host '  已开启。下次登录后会在后台自动换壁纸, 一个窗口都不会闪。'
       Write-Host ('  启动项位置: ' + $lnk)
+      Write-Host ('  指向: ' + $exe)
+      if ((Split-Path $exe -Leaf) -ne '微软壁纸助手.exe') {
+        Write-Host '  (这份 exe 名字里带版本号, 以后换新版本要重开一次本开关)' -ForegroundColor DarkYellow
+      }
     } catch { Write-Host ('  开启失败: ' + $_.Exception.Message) }
   }
+}
+
+# ---------- [F] 收藏当前这张壁纸 ----------
+# 取当前壁纸: 优先用 state 里程序自己记的那张, 读不到再回退注册表
+# (用户可能自己手动换过壁纸, 那张也一样该能收藏)。
+function Toggle-BwFavCurrent {
+  $s = Get-BwState
+  $p = [string]$s.last_wall
+  if (-not $p) { $p = [string](Get-ItemProperty 'HKCU:\Control Panel\Desktop' -ErrorAction SilentlyContinue).Wallpaper }
+  if (-not $p) { Write-Host '  还不知道当前是哪张 —— 换一张之后就能收藏了。'; return }
+  $nm = Split-Path $p -Leaf
+  if (Add-BwFav $s $nm) {
+    Save-BwState $s
+    Write-Host ('  已收藏 ★ ' + $nm)
+    if (-not (Test-Path -LiteralPath $p)) {
+      Write-Host '  不过这张已经不在库里了, 收藏先记下 —— 图找回来就能用。' -ForegroundColor DarkYellow
+    }
+    Log ('收藏: ' + $nm)
+    return
+  }
+  [void](Remove-BwFav $s $nm)
+  Save-BwState $s
+  Write-Host ('  已取消收藏 ' + $nm)
+  Log ('取消收藏: ' + $nm)
 }
 
 # ---------- 主菜单 ----------
@@ -474,6 +772,8 @@ if (-not (Test-Path -LiteralPath $global:CfgPath)) { Invoke-BwFirstRun }
 do {
   $c0 = Get-BwConfig
   $s0 = Get-BwState
+  # 桌面快捷方式: 每次进菜单核对一遍, 没有就建, 指错就修, exe 更新过就刷新图标
+  $desk = Ensure-BwDesktopShortcut
   $bingN = Count-Jpg $c0.bing_save_dir
   $spotN = Count-Jpg $c0.spotlight_save_dir
   Clear-Host
@@ -484,9 +784,17 @@ do {
   $next = '还没换过'
   if ($last) { $next = $last.AddMinutes([int]$c0.cycle_minutes).ToString('HH:mm') }
   $auto = '关'
-  if (Test-BwAutoStart) { $auto = '开' }
+  $moved = $false
+  if (Test-BwAutoStart) { $auto = '开'; $moved = Repair-BwAutoStart }
   Write-Host (' 今日必应: ' + $bingDone + '    下次自动换: ' + $next + '    开机自动换: ' + $auto) -ForegroundColor DarkGray
+  if ($moved) { Write-Host '  (程序位置变过, 开机自动换已重新指向当前这个 exe)' -ForegroundColor Yellow }
+  if ($desk -eq 'create') { Write-Host '  已在桌面放了「微软壁纸助手」快捷方式 (不想要: 设置 [6] 里关)' -ForegroundColor DarkYellow }
+  elseif ($desk -eq 'update') { Write-Host '  桌面快捷方式已指向当前这份程序, 图标也是新的' -ForegroundColor DarkYellow }
   Write-Host (' 壁纸库: 必应 ' + $bingN + ' 张 · 聚焦 ' + $spotN + ' 张 · 待换队列剩 ' + (Left-Queue $s0) + ' 张') -ForegroundColor DarkGray
+  # 收藏只在开了「只看收藏」时才占一行 —— 平时不打扰
+  if ([bool]$c0.fav_only) {
+    Write-Host (' 收藏: ' + @(Get-BwFavFiles $s0).Count + ' 张 · 只在收藏里轮换: 开') -ForegroundColor DarkGray
+  }
   $base0 = Get-BwBaseOf $c0
   if ($base0) { Write-Host (' 保存位置: ' + $base0) -ForegroundColor DarkGray }
   else {
@@ -522,6 +830,7 @@ do {
   Write-Host '  [7] 补下最近错过的必应 (几天没开机)'
   Write-Host '  [8] 下载往期必应 (2021 年至今, 4K)'
   Write-Host ' —— 其他 ——'
+  Write-Host '  [F] 收藏当前这张 / 取消收藏'
   Write-Host '  [S] 设置'
   Write-Host '  [A] 开机自动换壁纸  开 / 关'
   Write-Host '  [L] 查看运行日志'
@@ -539,6 +848,7 @@ do {
     '6' { Open-BwDir $c0.bing_save_dir; Open-BwDir $c0.spotlight_save_dir }
     '7' { Invoke-BwBackfillManual; Pause-Bw }
     '8' { Show-Archive }
+    'f' { Toggle-BwFavCurrent; Pause-Bw }
     's' { Show-BwSettings }
     'a' { Toggle-BwAutoStart; Pause-Bw }
     'l' { Get-Content -LiteralPath $global:BWLog -Tail 40 -Encoding UTF8 -ErrorAction SilentlyContinue; Pause-Bw }
