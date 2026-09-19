@@ -1,4 +1,4 @@
-# 微软壁纸助手 - 核心库 (by 海风 & Cindy)
+﻿# 微软壁纸助手 - 核心库 (by 海风 & Cindy)
 param([switch]$Update, [switch]$Cycle, [switch]$DryRun)
 $global:BWRoot = $PSScriptRoot
 $global:CfgPath = Join-Path $global:BWRoot 'config.json'
@@ -297,7 +297,7 @@ function Get-BwConfig {
 function Save-BwConfig([psobject]$c) {
   [System.IO.File]::WriteAllText($global:CfgPath, ($c | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($false)))
 }
-# ---- 自动轮换进度 (state.json): 计划任务每次是独立进程, 靠这个文件把节奏串起来 ----
+# ---- 自动轮换进度 (state.json): 每次运行是独立进程, 靠这个文件把节奏串起来 ----
 # 只记三件事: 今天切过必应没有 / 上次换壁纸是什么时候 / 上次开机时间。
 # 聚焦的"不重复"靠 queue —— 把库里所有图洗一次牌按顺序发, 发完再下载 6 张重洗一轮。
 function Get-BwState {
@@ -971,6 +971,5 @@ function Invoke-BwCycle {
   } catch { Log ('轮换异常: ' + $_.Exception.Message) }
 }
 # 注意: -Update 与 -Cycle 走同一套逻辑。
-# 老计划任务的动作是 -Update, 而改任务参数需要管理员权限; 让 -Update 也进新节奏,
-# 就能零提权立刻生效。将来用 install-task.ps1 重装会写成 -Cycle。
+# 老版本的开机自启动作是 -Update; 让 -Update 也进新节奏, 老用户不用重装就能零提权生效。
 if ($Cycle -or $Update) { Invoke-BwCycle }
