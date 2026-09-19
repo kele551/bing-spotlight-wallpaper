@@ -177,13 +177,13 @@
 
 有问题 / 想提意见:
   直接发邮件到 75219857@qq.com, 或者在 GitHub 上开 Issue:
-  https://github.com/kele551/bing-spotlight-wallpaper/issues
+  https://github.com/kele551/ms-wallpaper-assistant/issues
 
   邮件里带上这几样能省一轮来回:
     - Windows 版本 (设置 - 系统 - 关于)
-    - 程序版本号 (菜单标题上就有, 例如 v1.5.1)
+    - 程序版本号 (菜单标题上就有, 例如 v1.5.2)
     - 「微软壁纸助手数据\wallpaper.log」末尾十几行
 
 
-开源: https://github.com/kele551/微软壁纸助手
+开源: https://github.com/kele551/ms-wallpaper-assistant
 许可: MIT
